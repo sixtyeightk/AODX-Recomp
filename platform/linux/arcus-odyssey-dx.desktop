@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Arcus Odyssey DX
+Comment=Arcus Odyssey, recompiled for modern systems
+Exec=arcus-odyssey-dx
+Icon=arcus-odyssey-dx
+Terminal=false
+Categories=Game;ActionGame;
+StartupWMClass=arcus-odyssey-dx

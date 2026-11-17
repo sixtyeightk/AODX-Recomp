@@ -1,0 +1,87 @@
+From e00bb86e88f3d97d56d1117a6db6071655daf91f Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:08:05 -0400
+Subject: [PATCH 13/18] E5: HostPresenter.owns_hotkeys gates the runner's own
+ state hotkeys
+
+When a game's overlay owns the menu button, the runner ignores keyboard
+F1-F9 (quick load/save) and F7/F8, the pad chords Back+RB / Back+R3 and the
+LB/RB quicksave taps. Fullscreen and Escape stay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/host_present.h |  5 +++++
+ runner/main.c         | 12 ++++++++----
+ 2 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/runner/host_present.h b/runner/host_present.h
+index 5736320..0feab21 100644
+--- a/runner/host_present.h
++++ b/runner/host_present.h
+@@ -34,4 +34,9 @@ typedef struct HostPresenter {
+      * when it drew into the window's back buffer, in which case the runner
+      * skips its own upload/copy and only calls SDL_RenderPresent(). */
+     int  (*draw)(const uint32_t *argb, int width, int height, int stride);
++    /* Non-zero: the game's own overlay owns the runner hotkeys. The runner
++     * then ignores its keyboard F1-F9 (quick load/save) and F7/F8 (states
++     * browser, rewind), the pad chords Back+RB / Back+R3 and the LB/RB
++     * quicksave taps. Fullscreen and window keys stay. */
++    int  owns_hotkeys;
+ } HostPresenter;
+diff --git a/runner/main.c b/runner/main.c
+index c9638d0..b0e589c 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -3236,6 +3236,7 @@ session_begin:;
+         }
+ 
+         int overlay_request = 0;
++        const int runner_hotkeys = !(g_game_spec.presenter && g_game_spec.presenter->owns_hotkeys);
+         SDL_Event ev;
+         while (SDL_PollEvent(&ev)) {
+             gamepad_handle_event(&ev);
+@@ -3250,11 +3251,13 @@ session_begin:;
+ #endif
+             if (ev.type == SDL_QUIT) { running = 0; window_close_requested = 1; break; }
+             if (ev.type == SDL_KEYDOWN) {
+-                if (!ev.key.repeat && !(ev.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL)) &&
++                /* runner_hotkeys == 0: the game's overlay owns F1-F9/F7/F8
++                 * (HostPresenter.owns_hotkeys). */
++                if (runner_hotkeys && !ev.key.repeat && !(ev.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL)) &&
+                     ev.key.keysym.sym == SDLK_F7) {
+                     overlay_request = 2; continue;
+                 }
+-                if (!ev.key.repeat && !(ev.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL)) &&
++                if (runner_hotkeys && !ev.key.repeat && !(ev.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL)) &&
+                     ev.key.keysym.sym == SDLK_F8) {
+                     overlay_request = 1; continue;
+                 }
+@@ -3291,7 +3294,7 @@ session_begin:;
+                 /* Save states: Shift+F1-F9 = save, F1-F9 = load */
+                 {
+                     int slot = -1;
+-                    if (ev.key.keysym.sym >= SDLK_F1 && ev.key.keysym.sym <= SDLK_F9)
++                    if (runner_hotkeys && ev.key.keysym.sym >= SDLK_F1 && ev.key.keysym.sym <= SDLK_F9)
+                         slot = ev.key.keysym.sym - SDLK_F1 + 1;
+                     if (slot >= 1 && slot <= 9) {
+                         int is_save = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+@@ -3332,7 +3335,7 @@ session_begin:;
+             continue;   /* game-owned pause overlay: no tick this iteration */
+         }
+         {
+-            uint32_t pad = gamepad_overlay_mask();
++            uint32_t pad = runner_hotkeys ? gamepad_overlay_mask() : 0;
+             uint32_t menu = GP_OVERLAY_BACK | GP_OVERLAY_RB;
+             uint32_t rewind = GP_OVERLAY_BACK | GP_OVERLAY_R3;
+             if ((pad & rewind) == rewind && (prev_overlay_pad & rewind) != rewind)
+@@ -3363,6 +3366,7 @@ session_begin:;
+         {
+             int save_slot = gamepad_consume_quicksave();
+             int load_slot = gamepad_consume_quickload();
++            if (!runner_hotkeys) save_slot = load_slot = 0;
+             if (save_slot || load_slot) {
+                 int slot = save_slot ? save_slot : load_slot;
+                 char slot_name[48];
+-- 
+2.50.1 (Apple Git-155)
+

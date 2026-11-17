@@ -1,0 +1,86 @@
+From 42bf87358034be3bb6962bbf5c7300505a18471e Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:24:25 -0400
+Subject: [PATCH 15/18] Host pause audio API and a public cold reset
+
+audio_pause(): stop the device during a host pause (menu, rewind) and restart
+the bridge empty on resume; a starved bridge otherwise conceals the gap by
+looping recent audio, which sounds like the last effect repeating.
+runner_cold_reset(): cold power-on from host code (a game menu's Reset).
+---
+ runner/audio.c | 19 +++++++++++++++++++
+ runner/audio.h |  4 ++++
+ runner/main.c  |  5 +++++
+ 3 files changed, 28 insertions(+)
+
+diff --git a/runner/audio.c b/runner/audio.c
+index 5d9c270..6ffc40d 100644
+--- a/runner/audio.c
++++ b/runner/audio.c
+@@ -254,6 +254,25 @@ int audio_reopen(void)
+     return 0;
+ }
+ 
++/* Host pause (menus, rewind): stop the device instead of starving it. A
++ * starved bridge conceals the gap by looping recent audio, which sounds like
++ * the current effect repeating. On resume the ring restarts empty and the
++ * bridge's pre-roll fades back in. */
++void audio_pause(int paused)
++{
++    static int s_paused = 0;
++    if (s_dev == 0 || paused == s_paused) return;
++    s_paused = paused;
++    if (paused) {
++        SDL_PauseAudioDevice(s_dev, 1);
++    } else {
++        SDL_LockAudioDevice(s_dev);
++        if (s_bridge_ready) rab_reset(&s_bridge);
++        SDL_UnlockAudioDevice(s_dev);
++        SDL_PauseAudioDevice(s_dev, 0);
++    }
++}
++
+ void audio_set_playback_enabled(int enabled)
+ {
+     enabled = enabled != 0;
+diff --git a/runner/audio.h b/runner/audio.h
+index 03bc309..71ba1d5 100644
+--- a/runner/audio.h
++++ b/runner/audio.h
+@@ -31,6 +31,10 @@ void audio_output_stage_process(int16_t *buf, size_t frames, double rate);
+  * state, so turbo is silent and normal-speed playback resumes cleanly. WAV
+  * capture is independent and remains active. */
+ void audio_set_playback_enabled(int enabled);
++
++/* Pause/resume the output device for a host pause (menu, rewind) without the
++ * bridge concealing the gap by looping recent audio. */
++void audio_pause(int paused);
+ /* Discard device/DRC samples from the timeline abandoned by a quickload. */
+ void audio_discard_playback(void);
+ 
+diff --git a/runner/main.c b/runner/main.c
+index b0e589c..4db3e41 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -288,6 +288,7 @@ static RuntimeUiContext s_runtime_ui;
+ static int s_quickstate_slot=1;
+ int runner_save_state_file(const char *path);
+ int runner_load_state_file(const char *path);
++int runner_cold_reset(void);
+ static const char *const s_mod_aspects[]={"Adaptive","16:9","21:9","32:9"};
+ static const RecompRuntimeUiItem s_video_mod_items[]={
+     {"mods.widescreen.enabled","Mods","Widescreen","Opt-in custom scene renderer with expanded objects and screen-anchored HUD.",RECOMP_RUNTIME_UI_BOOL,0,1,1},
+@@ -1731,6 +1732,10 @@ static int genesis_session_reset(const char *rom_path)
+     return 1;
+ }
+ 
++/* Cold power-on from host code (e.g. a game menu's Reset). The battery save
++ * is not re-read (pass a ROM path through genesis_session_reset for that). */
++int runner_cold_reset(void) { return genesis_session_reset(NULL); }
++
+ #if GENESIS_HAS_RECOMP_NET
+ /* Retain local preferences separately from the adopted match configuration.
+  * A launcher can CREATE/START before the renderer and machine exist, and its
+-- 
+2.50.1 (Apple Git-155)
+

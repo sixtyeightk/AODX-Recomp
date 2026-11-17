@@ -1,0 +1,159 @@
+From 471be2993ff8dc868fc938595673734748d59b48 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:23:50 -0400
+Subject: [PATCH 12/18] E5: optional game-owned presenter and pause hooks
+ (GameSpec.presenter)
+
+runner/host_present.h defines HostPresenter: configure_window (size, flags,
+GL attributes and render-driver hint before SDL_CreateWindow), init (after the
+renderer exists), pre_raster (end of widescreen_update_for_frame: per-frame
+VDP margin/canvas), pause_frame (after event polling; returning 1 skips the
+tick) and draw (replaces the SDL upload/copy; SDL_RenderPresent still swaps).
+A NULL presenter, or NULL members, keep the stock path unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/game_spec.h    |  4 ++++
+ runner/host_present.h | 37 +++++++++++++++++++++++++++++++++++++
+ runner/main.c         | 17 +++++++++++++++++
+ 3 files changed, 58 insertions(+)
+ create mode 100644 runner/host_present.h
+
+diff --git a/runner/game_spec.h b/runner/game_spec.h
+index 466d377..328793f 100644
+--- a/runner/game_spec.h
++++ b/runner/game_spec.h
+@@ -26,6 +26,7 @@
+ #include <stdint.h>
+ #include "game_video.h"
+ struct RecompLauncherCModProvider;
++struct HostPresenter;   /* host_present.h */
+ 
+ /*
+  * One per-game TCP debug command. The handler receives the request id
+@@ -39,6 +40,9 @@ typedef struct {
+ 
+ typedef struct GameSpec {
+     const GameVideo *video;          /* NULL = native VDP presentation only */
++    /* Optional game-owned presenter / pause overlay (host_present.h).
++     * NULL = the runner's stock SDL_Renderer presentation. */
++    const struct HostPresenter *presenter;
+     /* Custom-video mode for a fresh install (no saved [mods.widescreen]
+      * enabled key): NULL or "off" keeps the renderer opt-in; "fit", "16:9",
+      * "21:9" or "32:9" enables it. A saved choice, including off, still wins. */
+diff --git a/runner/host_present.h b/runner/host_present.h
+new file mode 100644
+index 0000000..5736320
+--- /dev/null
++++ b/runner/host_present.h
+@@ -0,0 +1,37 @@
++#pragma once
++/*
++ * host_present.h — optional game-owned presentation and pause hooks.
++ *
++ * A game sets GameSpec.presenter to take over how finished frames reach the
++ * screen (for example a raw-GL presenter with a CRT shader and integer
++ * scaling), to choose per-frame VDP widescreen parameters, and to run a modal
++ * pause overlay between guest frames. Every member may be NULL; a NULL
++ * presenter keeps the runner's stock SDL_Renderer path byte-for-byte.
++ *
++ * All calls happen on the runner thread. None may advance the guest.
++ */
++#include <stdint.h>
++
++struct SDL_Window;
++struct SDL_Renderer;
++
++typedef struct HostPresenter {
++    /* Before SDL_CreateWindow: may change the window size and SDL_WINDOW_*
++     * flags (e.g. add SDL_WINDOW_OPENGL) and set SDL hints / GL attributes
++     * (e.g. SDL_HINT_RENDER_DRIVER) that the renderer creation then uses. */
++    void (*configure_window)(int *width, int *height, uint32_t *flags);
++    /* After the window, renderer and frame texture exist. */
++    void (*init)(struct SDL_Window *window, struct SDL_Renderer *renderer);
++    /* End of the pre-raster step of every tick (after the runner's own
++     * widescreen decision): may override gvdp_set_ws_extra()/_canvas()/
++     * _bar_black() for the frame about to be rendered. */
++    void (*pre_raster)(void);
++    /* After the frame's SDL events were polled. Returns 1 when the game is
++     * paused this iteration (the presenter already showed something and paced
++     * itself); the runner then skips the tick. May clear *running to quit. */
++    int  (*pause_frame)(int *running);
++    /* Draw a finished frame (ARGB8888, `stride` pixels per row). Returns 1
++     * when it drew into the window's back buffer, in which case the runner
++     * skips its own upload/copy and only calls SDL_RenderPresent(). */
++    int  (*draw)(const uint32_t *argb, int width, int height, int stride);
++} HostPresenter;
+diff --git a/runner/main.c b/runner/main.c
+index 8025687..c9638d0 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -190,6 +190,7 @@ static int run_picker_cmd(const char *cmd, char *out, size_t max_len)
+ 
+ #include "cmd_server.h"
+ #include "game_spec.h"
++#include "host_present.h"
+ #include "game_layout.h"
+ #include "gamepad.h"
+ #include "input_map.h"
+@@ -741,6 +742,8 @@ static void widescreen_update_for_frame(void)
+         }
+         s_prev_ws_extra = extra_px;
+     }
++    if (g_game_spec.presenter && g_game_spec.presenter->pre_raster)
++        g_game_spec.presenter->pre_raster();   /* game-owned VDP margins */
+ }
+ 
+ /* Scripted input: --script "start@700,right@800" */
+@@ -2752,6 +2755,8 @@ int main(int argc, char *argv[])
+         if (g_app_config.fullscreen == 2)      win_flags |= SDL_WINDOW_FULLSCREEN;
+         else if (g_app_config.fullscreen == 1) win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+     }
++    if (g_game_spec.presenter && g_game_spec.presenter->configure_window)
++        g_game_spec.presenter->configure_window(&win_w, &win_h, &win_flags);
+     SDL_Window *window = SDL_CreateWindow(
+         window_title,
+         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+@@ -2813,6 +2818,8 @@ int main(int argc, char *argv[])
+     }
+     s_video_renderer = renderer;
+     s_video_texture = &texture;
++    if (g_game_spec.presenter && g_game_spec.presenter->init)
++        g_game_spec.presenter->init(window, renderer);
+     {
+         SDL_ScaleMode mode = SDL_ScaleModeNearest;
+         if (SDL_GetTextureScaleMode(texture, &mode) == 0)
+@@ -3319,6 +3326,11 @@ session_begin:;
+         if (!genesis_switch_frame()) { running = 0; window_close_requested = 1; break; }
+ #endif
+         if (g_game_spec.input_frame) g_game_spec.input_frame(frame_num);
++        if (g_game_spec.presenter && g_game_spec.presenter->pause_frame &&
++            g_game_spec.presenter->pause_frame(&running)) {
++            if (!running) { window_close_requested = 1; break; }
++            continue;   /* game-owned pause overlay: no tick this iteration */
++        }
+         {
+             uint32_t pad = gamepad_overlay_mask();
+             uint32_t menu = GP_OVERLAY_BACK | GP_OVERLAY_RB;
+@@ -3756,6 +3768,10 @@ session_begin:;
+             present_src = s_present_buf;
+         }
+ #endif
++        int host_drawn = g_game_spec.presenter && g_game_spec.presenter->draw &&
++            g_game_spec.presenter->draw(present_src, s_screen_width, s_screen_height,
++                                        MAX_SCREEN_WIDTH);
++        if (!host_drawn) {
+         update_render_logical_size(renderer);
+         SDL_RenderClear(renderer);
+ 
+@@ -3812,6 +3828,7 @@ session_begin:;
+             peer_view_was_active = peer_view_is_active;
+         }
+         SDL_RenderCopy(renderer, frame_texture, &src, NULL);
++        }   /* !host_drawn */
+ #if GENESIS_HAS_RECOMP_NET
+         /* Process the peer INPUT and emit our CONFIRM before the blocking
+          * present, so confirmation delivery overlaps vsync as well. */
+-- 
+2.50.1 (Apple Git-155)
+

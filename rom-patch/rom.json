@@ -1,0 +1,15 @@
+{
+  "input": {
+    "name": "Arcus Odyssey (USA)",
+    "size": 1048576,
+    "crc32": "bc4d9b20",
+    "sha1": "26feaafad8c464ce3fa96912c2a85c7596e5fa4e"
+  },
+  "patch": "arcus-odyssey-dx.ips",
+  "output": {
+    "name": "arcus-odyssey-usa-dx.bin",
+    "size": 2097152,
+    "crc32": "a4f03bae",
+    "sha1": "ef3a0a0fea4618d92854d4510ffe014132cfb00a"
+  }
+}

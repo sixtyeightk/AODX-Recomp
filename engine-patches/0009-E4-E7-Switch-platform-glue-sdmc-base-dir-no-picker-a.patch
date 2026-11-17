@@ -1,0 +1,354 @@
+From 9bd7cd50d533598a9ed99b5538e39e5d016e4696 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:24:30 -0400
+Subject: [PATCH 09/18] E4+E7: Switch platform glue (sdmc base dir, no picker,
+ applet pause, audio reopen)
+
+runner/platform_switch.{c,h} (empty unless GENESIS_PLATFORM_SWITCH, i.e.
+__SWITCH__ or GENESIS_SWITCH_STUBS):
+
+E4
+- genesis_switch_base_dir(): sdmc:/switch/<GENESIS_SWITCH_APP_DIR>/, created on
+  first use. init_exe_dir() uses it instead of the exe directory and chdirs
+  there, so settings.ini, saves, states and runtime evidence land on the SD
+  card. Stub builds map sdmc:/ to $GENESIS_FAKE_SDMC (default ./fake-sdmc).
+- On the console stderr goes to <base>/log.txt (line-buffered).
+- No popen ROM picker on Switch (the ROM is embedded or given as argv[1]).
+- runtime_evidence: no module-path lookup on Switch (compile stamp instead).
+  The TCP debug server is turned off by the game build (GEN_ENABLE_TRACE=OFF).
+
+E7
+- genesis_switch_init() hooks applet focus/resume messages.
+- genesis_switch_frame(), once per frame after SDL events: while the app is
+  out of focus it pauses (audio off, events and appletMainLoop pumped, 10 ms
+  sleeps) and pushes SDL_QUIT if the system asks to exit; when focus returns
+  (or after the system resumed a suspended process) it reopens the SDL audio
+  device via the new audio_reopen(), since audren output can stay silent
+  after a suspension.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/GenesisRecompRunner.cmake |   1 +
+ runner/audio.c                  |  11 +++
+ runner/audio.h                  |   5 ++
+ runner/main.c                   |  24 ++++++-
+ runner/platform_switch.c        | 121 ++++++++++++++++++++++++++++++++
+ runner/platform_switch.h        |  41 +++++++++++
+ runner/runtime_evidence.c       |   5 ++
+ 7 files changed, 207 insertions(+), 1 deletion(-)
+ create mode 100644 runner/platform_switch.c
+ create mode 100644 runner/platform_switch.h
+
+diff --git a/cmake/GenesisRecompRunner.cmake b/cmake/GenesisRecompRunner.cmake
+index cd9a5d2..befb640 100644
+--- a/cmake/GenesisRecompRunner.cmake
++++ b/cmake/GenesisRecompRunner.cmake
+@@ -54,6 +54,7 @@ set(GENESIS_RUNNER_CORE_SOURCES
+     glue.c
+     runtime_evidence.c
+     fiber_compat.c
++    platform_switch.c
+     crash_report.c
+     input_script.c
+     gamepad.c
+diff --git a/runner/audio.c b/runner/audio.c
+index 7300029..bf307da 100644
+--- a/runner/audio.c
++++ b/runner/audio.c
+@@ -197,6 +197,17 @@ void audio_close(void)
+     }
+ }
+ 
++int audio_reopen(void)
++{
++    if (s_dev == 0) return -1;
++    AudioExtraSource source = s_extra_source;
++    int rate = (int)s_mix_rate;
++    audio_close();
++    if (audio_init(rate) != 0) return -1;
++    s_extra_source = source;
++    return 0;
++}
++
+ void audio_set_playback_enabled(int enabled)
+ {
+     enabled = enabled != 0;
+diff --git a/runner/audio.h b/runner/audio.h
+index 8a6767f..7bb7473 100644
+--- a/runner/audio.h
++++ b/runner/audio.h
+@@ -11,6 +11,11 @@
+  */
+ int  audio_init(int psg_sample_rate);
+ void audio_close(void);
++/* Close and reopen the output device with the same internal rate, keeping the
++ * extra source and volume. For platforms whose audio output can come back dead
++ * after the app was suspended (Switch HOME menu / sleep). Returns 0 on
++ * success, -1 when no device was open or reopening failed. */
++int  audio_reopen(void);
+ 
+ /* Master output volume, 0..100 (settings.ini / launcher). Speaker stream only;
+  * the WAV capture tap stays bit-exact. */
+diff --git a/runner/main.c b/runner/main.c
+index d0851f0..cc4fa8f 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -35,6 +35,7 @@
+ #include "png_write.h"
+ #include "runtime_evidence.h"
+ #include "local_states.h"
++#include "platform_switch.h"
+ 
+ /* =========================================================================
+  * Path helper: resolve filenames relative to the exe directory.
+@@ -77,6 +78,17 @@ static uint64_t benchmark_process_cpu_cycles(void)
+ 
+ static void init_exe_dir(const char *argv0)
+ {
++#if GENESIS_PLATFORM_SWITCH
++    /* Switch: an .nro has no meaningful exe directory. Settings, saves and
++     * runtime evidence live in the fixed SD-card app folder, and cwd follows
++     * so cwd-relative outputs (dispatch_misses.toml) land there too. */
++    (void)argv0;
++    snprintf(s_exe_dir, sizeof(s_exe_dir), "%s", genesis_switch_base_dir());
++    genesis_switch_open_log();
++    if (chdir(s_exe_dir) != 0)
++        fprintf(stderr, "chdir(%s) failed\n", s_exe_dir);
++    return;
++#endif
+     /* Try platform API first */
+ #ifdef _WIN32
+     GetModuleFileNameA(NULL, s_exe_dir, sizeof(s_exe_dir) - 1);
+@@ -148,7 +160,7 @@ static int rom_has_sega_header(const char *path)
+ }
+ #endif
+ 
+-#if !defined(_WIN32) && !defined(__ANDROID__)
++#if !defined(_WIN32) && !defined(__ANDROID__) && !GENESIS_PLATFORM_SWITCH
+ /* Run one shell-wrapped native file chooser; read the selected path from its
+  * stdout. Each command is gated on `command -v <tool>` so an absent tool
+  * prints nothing and we fall through. Returns 1 and fills `out` only on a
+@@ -2541,6 +2553,9 @@ int main(int argc, char *argv[])
+             if (GetOpenFileNameA(&ofn))
+                 rom_path = picked_path;
+         }
++#elif GENESIS_PLATFORM_SWITCH
++        /* Switch: no file pickers or shell. The ROM is embedded in the .nro
++         * (GameSpec.embedded_rom) or given as argv[1]. */
+ #elif defined(__ANDROID__)
+         /* No file-picker processes on Android. Boot the ROM cached in
+          * rom-<short_name>.cfg when it still exists, else the first Genesis
+@@ -2684,6 +2699,9 @@ int main(int argc, char *argv[])
+         return 1;
+     }
+     gamepad_init_players(g_game_spec.logical_players);
++#if GENESIS_PLATFORM_SWITCH
++    genesis_switch_init();
++#endif
+ 
+     /* Every Genesis game uses a clean title. Backend/build/debug-port identity
+      * belongs in diagnostics and About, never in the window caption. */
+@@ -3289,6 +3307,10 @@ session_begin:;
+         }
+ 
+         if (!running) break; /* Close must not execute another game/render tick. */
++#if GENESIS_PLATFORM_SWITCH
++        /* Blocks (audio paused) while HOME/sleep/an applet has focus. */
++        if (!genesis_switch_frame()) { running = 0; window_close_requested = 1; break; }
++#endif
+         if (g_game_spec.input_frame) g_game_spec.input_frame(frame_num);
+         {
+             uint32_t pad = gamepad_overlay_mask();
+diff --git a/runner/platform_switch.c b/runner/platform_switch.c
+new file mode 100644
+index 0000000..d9479ca
+--- /dev/null
++++ b/runner/platform_switch.c
+@@ -0,0 +1,121 @@
++/*
++ * platform_switch.c — Nintendo Switch (libnx) platform glue; see
++ * platform_switch.h. Empty unless GENESIS_PLATFORM_SWITCH.
++ *
++ * Applet model: libnx's default focus handling (SuspendHomeSleep) lets the
++ * system suspend the whole process while the HOME menu is open or the
++ * console sleeps, so emulation stops by itself there. For the remaining
++ * out-of-focus states (an overlay library applet, or a focus handling mode
++ * that keeps the process running) genesis_switch_frame() pauses the frame
++ * loop itself. Either way, when focus returns the SDL audio device is closed
++ * and reopened: audren output can stay silent after a suspension otherwise.
++ */
++#include "platform_switch.h"
++
++#if GENESIS_PLATFORM_SWITCH
++
++#include <switch.h>
++#include <SDL2/SDL.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include "audio.h"
++
++#ifndef GENESIS_SWITCH_APP_DIR
++#define GENESIS_SWITCH_APP_DIR "genesis-recomp"
++#endif
++
++static char s_base_dir[512];
++
++static const char *sdmc_root(void)
++{
++#if defined(__SWITCH__)
++    return "sdmc:/";
++#else
++    /* Switch-stub desktop build: map sdmc:/ onto a local folder. */
++    static char root[480];
++    if (!root[0]) {
++        const char *r = getenv("GENESIS_FAKE_SDMC");
++        snprintf(root, sizeof root, "%s/", (r && r[0]) ? r : "fake-sdmc");
++        char dir[480];
++        snprintf(dir, sizeof dir, "%s", root);
++        dir[strlen(dir) - 1] = '\0';
++        mkdir(dir, 0777);
++    }
++    return root;
++#endif
++}
++
++const char *genesis_switch_base_dir(void)
++{
++    if (!s_base_dir[0]) {
++        char dir[512];
++        snprintf(dir, sizeof dir, "%sswitch", sdmc_root());
++        mkdir(dir, 0777);                       /* normally exists already */
++        snprintf(dir, sizeof dir, "%sswitch/%s", sdmc_root(), GENESIS_SWITCH_APP_DIR);
++        mkdir(dir, 0777);
++        snprintf(s_base_dir, sizeof s_base_dir, "%s/", dir);
++    }
++    return s_base_dir;
++}
++
++void genesis_switch_open_log(void)
++{
++#if defined(__SWITCH__)
++    char path[600];
++    snprintf(path, sizeof path, "%slog.txt", genesis_switch_base_dir());
++    if (freopen(path, "w", stderr))
++        setvbuf(stderr, NULL, _IOLBF, 1024);
++#endif
++}
++
++static AppletHookCookie s_hook_cookie;
++static volatile int s_focus_event;   /* set from appletMainLoop (main thread) */
++
++static void applet_hook(AppletHookType hook, void *param)
++{
++    (void)param;
++    if (hook == AppletHookType_OnFocusState || hook == AppletHookType_OnResume)
++        s_focus_event = 1;
++}
++
++void genesis_switch_init(void)
++{
++    appletHook(&s_hook_cookie, applet_hook, NULL);
++    fprintf(stderr, "[switch] base dir %s, operation mode %s\n", genesis_switch_base_dir(),
++            appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld");
++}
++
++int genesis_switch_frame(void)
++{
++    int paused = 0;
++    while (appletGetFocusState() != AppletFocusState_InFocus) {
++        if (!paused) {
++            paused = 1;
++            audio_set_playback_enabled(0);
++            fprintf(stderr, "[switch] out of focus: emulation paused\n");
++        }
++        int quit = !appletMainLoop();
++        SDL_PumpEvents();
++        if (quit || SDL_PeepEvents(NULL, 0, SDL_PEEKEVENT, SDL_QUIT, SDL_QUIT) > 0) {
++            SDL_Event ev;
++            memset(&ev, 0, sizeof ev);
++            ev.type = SDL_QUIT;
++            SDL_PushEvent(&ev);
++            return 0;
++        }
++        svcSleepThread(10000000LL);   /* 10 ms */
++    }
++    if (paused || s_focus_event) {
++        s_focus_event = 0;
++        int ok = audio_reopen() == 0;
++        fprintf(stderr, "[switch] in focus again: %s\n",
++                ok ? "audio reopened" : "no audio device to reopen");
++    }
++    return 1;
++}
++
++#endif /* GENESIS_PLATFORM_SWITCH */
+diff --git a/runner/platform_switch.h b/runner/platform_switch.h
+new file mode 100644
+index 0000000..8094bbf
+--- /dev/null
++++ b/runner/platform_switch.h
+@@ -0,0 +1,41 @@
++/*
++ * platform_switch.h — Nintendo Switch (libnx) platform glue for the runner.
++ *
++ * GENESIS_PLATFORM_SWITCH is 1 on the console (__SWITCH__) and in a desktop
++ * build that compiles these same code paths against libnx stubs
++ * (GENESIS_SWITCH_STUBS, which supplies its own <switch.h>), so the Switch
++ * paths can run in a headless desktop test suite. Elsewhere it is 0 and
++ * platform_switch.c compiles to nothing.
++ */
++#ifndef RUNNER_PLATFORM_SWITCH_H
++#define RUNNER_PLATFORM_SWITCH_H
++
++#if defined(__SWITCH__) || defined(GENESIS_SWITCH_STUBS)
++#define GENESIS_PLATFORM_SWITCH 1
++#else
++#define GENESIS_PLATFORM_SWITCH 0
++#endif
++
++#if GENESIS_PLATFORM_SWITCH
++/* Application folder on the SD card, with a trailing slash:
++ * "sdmc:/switch/<GENESIS_SWITCH_APP_DIR>/". Created on first use. Settings,
++ * saves, states and runtime evidence live here (there is no exe directory).
++ * Stub builds map "sdmc:/" to $GENESIS_FAKE_SDMC (default ./fake-sdmc/). */
++const char *genesis_switch_base_dir(void);
++
++/* On the console, send stderr (the runner's log) to <base dir>/log.txt,
++ * line-buffered; nothing else would show it. A no-op in stub builds. */
++void genesis_switch_open_log(void);
++
++/* After SDL_Init: register the applet hooks (focus, resume). */
++void genesis_switch_init(void);
++
++/* Once per host frame, after SDL events were pumped. While the app is out of
++ * focus (HOME menu, sleep, an overlay applet) this blocks with audio paused,
++ * pumping events, and returns when focus is back; it then reopens the audio
++ * device (audren can come back silent otherwise). Returns 0 when the system
++ * asked the app to exit (an SDL_QUIT is queued as well), else 1. */
++int genesis_switch_frame(void);
++#endif
++
++#endif /* RUNNER_PLATFORM_SWITCH_H */
+diff --git a/runner/runtime_evidence.c b/runner/runtime_evidence.c
+index ef421ed..1fdf9d1 100644
+--- a/runner/runtime_evidence.c
++++ b/runner/runtime_evidence.c
+@@ -127,6 +127,11 @@ static int exe_module_path(char *out, size_t n)
+         m = NULL;
+     DWORD r = GetModuleFileNameA(m, out, (DWORD)n);
+     return r > 0 && r < n;
++#elif defined(__SWITCH__)
++    /* An .nro has no readable module path (and hashing ~13 MB from the SD card
++     * at startup would be slow): use the compile stamp. */
++    (void)out; (void)n;
++    return 0;
+ #elif defined(__APPLE__) || defined(__ANDROID__)
+     Dl_info info;
+     if (!dladdr((void *)&genesis_build_exe_fingerprint, &info) || !info.dli_fname)
+-- 
+2.50.1 (Apple Git-155)
+

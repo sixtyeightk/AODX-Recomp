@@ -1,0 +1,50 @@
+{
+  "engine": {
+    "repo": "mstan/segagenesisrecomp",
+    "commit": "252535d12476f5a697cf87082ea3e827f6430a1b",
+    "path": "engine",
+    "sha256": "afd43f72e0ced3ce31285b3ac588f4228a8dbe18bc0f502b0d06da3583386c0e"
+  },
+  "submodules": [
+    {
+      "path": "external/m68k-recomp-core",
+      "repo": "mstan/m68k-recomp-core",
+      "commit": "e9ebf608933969903edd80ac0b79d41ddb2f013e",
+      "sha256": "a594005cd33232b09c41a4e6a43e898f280880e02e1fa162c141f703c19fe08c"
+    },
+    {
+      "path": "external/z80-recomp-core",
+      "repo": "mstan/z80-recomp-core",
+      "commit": "0e6606a41245d54c5fd0c3dc322ef9d6890d3923",
+      "sha256": "15a3bc4286bc2dff9f628228c0a08d3520fe93882d907c9899de16cb2030c649"
+    },
+    {
+      "path": "external/rbengine",
+      "repo": "RetroPortingToolKit/rbengine",
+      "commit": "2a03e73693acee0fb78076ea058642c931bef12e",
+      "sha256": "f0cef60afbb69aee8fa69133b3c4a8c81dc8ad990629f31de333dc1032aeb6d8"
+    }
+  ],
+  "patches": [
+    "0001-E1-optional-embedded-ROM-GameSpec.embedded_rom.patch",
+    "0002-E2-input-scripts-accept-X-Y-Z-MODE-6-button-pad.patch",
+    "0003-Write-exec-coverage-out-also-when-an-input-script-EX.patch",
+    "0004-Finalize-wav-when-an-input-script-EXITs.patch",
+    "0005-VDP-shadow-highlight-follows-hardware-priority-rules.patch",
+    "0006-E3-heap-fiber-stack-with-canary-guard-on-Switch.patch",
+    "0007-E9-allow-a-prebuilt-host-recompiler-for-cross-builds.patch",
+    "0008-E6-GameSpec-host-input-hooks-input_frame-input_mask.patch",
+    "0009-E4-E7-Switch-platform-glue-sdmc-base-dir-no-picker-a.patch",
+    "0010-E8-pace-one-Genesis-frame-per-60-Hz-vblank-on-Switch.patch",
+    "0011-Audio-optional-speaker-output-stage-DC-blocker-soft-.patch",
+    "0012-E5-optional-game-owned-presenter-and-pause-hooks-Gam.patch",
+    "0013-E5-HostPresenter.owns_hotkeys-gates-the-runner-s-own.patch",
+    "0014-VDP-raise-the-Z80-vblank-interrupt-every-frame-indep.patch",
+    "0015-Host-pause-audio-API-and-a-public-cold-reset.patch",
+    "0016-Deferred-runtime-evidence-writes-Switch-log-fully-bu.patch",
+    "0017-Raster-accurate-H-blank-status-flag-vsync-pacing-on-.patch",
+    "0018-Full-screen-tall-output-batched-planes-for-Arcus-lag.patch",
+    "0019-save_resume_pc-without-a-game-mode-byte.patch",
+    "0020-arcus-host-features.patch"
+  ]
+}

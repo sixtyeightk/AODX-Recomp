@@ -1,0 +1,79 @@
+From 02f4332d4cb7ab3878de08415cb6b46d1bb23e86 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:24:30 -0400
+Subject: [PATCH 08/18] E6: GameSpec host input hooks (input_frame, input_mask)
+
+input_frame(wall_frame) runs once per host frame on the main thread, after
+SDL events are pumped and before the controller ports are sampled.
+input_mask(player), when set, replaces the live keyboard/gamepad part of
+input_current_mask() (GPAD_* bits including X/Y/Z/Mode); input scripts and
+TCP input still merge on top. Lets a game own its controls (Arcus: libnx pad
+on Switch, twin-stick aim, ZR autofire, overlay gating) without touching the
+runner's input map. NULL hooks keep today's behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/game_spec.h | 13 +++++++++++++
+ runner/input_map.c |  2 ++
+ runner/main.c      |  1 +
+ 3 files changed, 16 insertions(+)
+
+diff --git a/runner/game_spec.h b/runner/game_spec.h
+index ea9afbe..466d377 100644
+--- a/runner/game_spec.h
++++ b/runner/game_spec.h
+@@ -195,6 +195,19 @@ typedef struct GameSpec {
+      * inside call_hblank instead. */
+     void      (*on_hblank)(uint32_t line);
+ 
++    /* ---- Host input (optional) ---- */
++    /* Called once per host frame on the main thread, after SDL events were
++     * pumped and before that frame's controller ports are sampled. The
++     * argument is the runner's wall-frame number (the one input scripts
++     * see). NULL = nothing. */
++    void      (*input_frame)(uint64_t wall_frame);
++    /* When set, replaces the live keyboard/gamepad part of
++     * input_current_mask() for a player: GPAD_* bits (genesis_bus.h layout,
++     * X/Y/Z/Mode included). Dev sources (input scripts, TCP) still merge on
++     * top; X/Y/Z/Mode reach the port only for 6-button pads. NULL = the
++     * runner's rebindable keyboard/gamepad map (input_map.c). */
++    uint16_t  (*input_mask)(int player);
++
+     /* ---- CLI args ---- */
+     /* Called once per unrecognized argv pair during startup. Return 1
+      * if the key was consumed (val too if applicable), 0 to let the
+diff --git a/runner/input_map.c b/runner/input_map.c
+index 37f1ef5..e909e5d 100644
+--- a/runner/input_map.c
++++ b/runner/input_map.c
+@@ -3,6 +3,7 @@
+  */
+ #include "input_map.h"
+ #include "gamepad.h"
++#include "game_spec.h"
+ 
+ #include <SDL2/SDL.h>
+ #include <string.h>
+@@ -111,6 +112,7 @@ uint16_t input_map_key_mask(int player)
+ uint16_t input_current_mask(int player)
+ {
+     if (player < 0 || player >= INPUT_MAX_PLAYERS) return 0;
++    if (g_game_spec.input_mask) return g_game_spec.input_mask(player);
+     const PlayerInput *pi = &g_input_map.p[player];
+     uint16_t m = 0;
+     if (pi->device & INPUT_DEV_KEYBOARD) m |= input_map_key_mask(player);
+diff --git a/runner/main.c b/runner/main.c
+index f8e158e..d0851f0 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -3289,6 +3289,7 @@ session_begin:;
+         }
+ 
+         if (!running) break; /* Close must not execute another game/render tick. */
++        if (g_game_spec.input_frame) g_game_spec.input_frame(frame_num);
+         {
+             uint32_t pad = gamepad_overlay_mask();
+             uint32_t menu = GP_OVERLAY_BACK | GP_OVERLAY_RB;
+-- 
+2.50.1 (Apple Git-155)
+

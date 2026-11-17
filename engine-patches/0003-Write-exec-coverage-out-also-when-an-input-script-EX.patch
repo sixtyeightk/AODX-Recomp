@@ -1,0 +1,94 @@
+From 4936bb1b2fc138653fdc8038f26c9296840b93c6 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:57:06 -0400
+Subject: [PATCH 03/18] Write --exec-coverage-out also when an input script
+ EXITs
+
+---
+ runner/main.c | 56 +++++++++++++++++++++++++++++----------------------
+ 1 file changed, 32 insertions(+), 24 deletions(-)
+
+diff --git a/runner/main.c b/runner/main.c
+index 684db7f..bee06f6 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -2150,6 +2150,36 @@ static void local_states_modal(SDL_Renderer *renderer, SDL_Texture *game,
+     audio_set_playback_enabled(!turbo);
+ }
+ 
++/* Write the interpreter's executed-PC set (--exec-coverage-out). Called at normal
++ * shutdown and when an input script EXITs (which returns early). */
++static void dump_exec_coverage(const char *exec_cov_out)
++{
++if (exec_cov_out) {
++    extern long m68k_interp_cov_dump(FILE *);        /* m68k_interp.c */
++    extern int genesis_force_interp(void);           /* glue.c */
++    const int _cov_forced = genesis_force_interp();
++    FILE *cf = fopen(exec_cov_out, "w");
++    if (!cf) {
++        fprintf(stderr, "[EXECCOV] cannot open '%s' for writing\n", exec_cov_out);
++    } else {
++        fprintf(cf, "# executed-PC coverage from the Tier-3 interpreter "
++                    "(m68k_interp). One word-aligned address per line.\n");
++        fprintf(cf, "# force_interp=%d — with GENESIS_FORCE_INTERP=1 this is the\n"
++                    "# complete set for the run; otherwise it is floor capsules only.\n",
++                _cov_forced);
++        long n = m68k_interp_cov_dump(cf);
++        fclose(cf);
++        if (n < 0)
++            fprintf(stderr, "[EXECCOV] nothing was interpreted this run; "
++                            "'%s' has no addresses. Set GENESIS_FORCE_INTERP=1 "
++                            "to interpret the whole program.\n", exec_cov_out);
++        else
++            fprintf(stderr, "[EXECCOV] wrote %ld executed PCs to %s\n",
++                    n, exec_cov_out);
++    }
++}
++}
++
+ int main(int argc, char *argv[])
+ {
+     init_exe_dir(argv[0]);
+@@ -3618,6 +3648,7 @@ session_begin:;
+                 fprintf(stderr, "[input_script] exiting per script directive (code=%d)\n",
+                         input_script_exit_code());
+                 if (s_sram_dirty) runner_sram_flush();
++                dump_exec_coverage(exec_cov_out);
+                 return input_script_exit_code();
+             }
+         }
+@@ -3944,30 +3975,7 @@ session_begin:;
+      * third-party code. Run with GENESIS_FORCE_INTERP=1 for a COMPLETE
+      * executed-PC set (the interpreter drives the whole program); without it
+      * the dump covers only what the Tier-3 floor executed. */
+-    if (exec_cov_out) {
+-        extern long m68k_interp_cov_dump(FILE *);        /* m68k_interp.c */
+-        extern int genesis_force_interp(void);           /* glue.c */
+-        const int _cov_forced = genesis_force_interp();
+-        FILE *cf = fopen(exec_cov_out, "w");
+-        if (!cf) {
+-            fprintf(stderr, "[EXECCOV] cannot open '%s' for writing\n", exec_cov_out);
+-        } else {
+-            fprintf(cf, "# executed-PC coverage from the Tier-3 interpreter "
+-                        "(m68k_interp). One word-aligned address per line.\n");
+-            fprintf(cf, "# force_interp=%d — with GENESIS_FORCE_INTERP=1 this is the\n"
+-                        "# complete set for the run; otherwise it is floor capsules only.\n",
+-                    _cov_forced);
+-            long n = m68k_interp_cov_dump(cf);
+-            fclose(cf);
+-            if (n < 0)
+-                fprintf(stderr, "[EXECCOV] nothing was interpreted this run; "
+-                                "'%s' has no addresses. Set GENESIS_FORCE_INTERP=1 "
+-                                "to interpret the whole program.\n", exec_cov_out);
+-            else
+-                fprintf(stderr, "[EXECCOV] wrote %ld executed PCs to %s\n",
+-                        n, exec_cov_out);
+-        }
+-    }
++    dump_exec_coverage(exec_cov_out);
+ 
+     /* --- Cleanup --- */
+ #if GENESIS_HAS_RECOMP_NET
+-- 
+2.50.1 (Apple Git-155)
+

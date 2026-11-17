@@ -1,0 +1,79 @@
+From 2955329ab73f4503f46590b761bd1186ef54d1d3 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:44:10 -0400
+Subject: [PATCH 01/18] E1: optional embedded ROM (GameSpec.embedded_rom)
+
+---
+ runner/game_spec.h |  6 ++++++
+ runner/main.c      | 26 ++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/runner/game_spec.h b/runner/game_spec.h
+index ad87d32..ea9afbe 100644
+--- a/runner/game_spec.h
++++ b/runner/game_spec.h
+@@ -82,6 +82,12 @@ typedef struct GameSpec {
+      * 0x80000, Sonic 2 is 0x100000, Sonic 3K is 0x400000. */
+     uint32_t    expected_rom_size;
+ 
++    /* Optional ROM linked into the executable (e.g. .incbin). When set and
++     * no ROM path is given, the runner boots it as "embedded:<short_name>"
++     * without a file picker; an explicit ROM path still wins. */
++    const uint8_t *embedded_rom;
++    uint32_t    embedded_rom_size;
++
+     /* Tier-3 interpreter floor default for THIS game (0 = off). When on,
+      * every computed-dispatch miss executes CORRECTLY on the A7-neutral
+      * interpreter capsule instead of silently no-op'ing, and the executed
+diff --git a/runner/main.c b/runner/main.c
+index 8196be8..8d5b733 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -1005,11 +1005,31 @@ static uint32_t rom_crc32(const uint8_t *data, size_t len)
+  * *out_words receives the number of 16-bit words; *raw_bytes receives the
+  * raw byte buffer (for glue_init's g_rom copy); *raw_len receives byte count.
+  * Caller must free() both returned pointers. */
++#define EMBEDDED_ROM_PREFIX "embedded:"
++
+ static cc_u16l *load_rom(const char *path,
+                           cc_u32l *out_words,
+                           uint8_t **raw_bytes,
+                           cc_u32l *raw_len)
+ {
++    if (strncmp(path, EMBEDDED_ROM_PREFIX, strlen(EMBEDDED_ROM_PREFIX)) == 0) {
++        cc_u32l n = g_game_spec.embedded_rom_size;
++        if (!g_game_spec.embedded_rom || n == 0 || n > 0x800000u || (n & 1u)) {
++            fprintf(stderr, "embedded ROM missing or invalid\n");
++            return NULL;
++        }
++        uint8_t *raw = (uint8_t *)malloc(n);
++        cc_u16l *buf = (cc_u16l *)malloc((n / 2) * sizeof(cc_u16l));
++        if (!raw || !buf) { free(raw); free(buf); return NULL; }
++        memcpy(raw, g_game_spec.embedded_rom, n);
++        for (cc_u32l i = 0; i < n / 2; i++)
++            buf[i] = (cc_u16l)(((cc_u16l)raw[i * 2] << 8) | raw[i * 2 + 1]);
++        *out_words = n / 2;
++        *raw_bytes = raw;
++        *raw_len   = n;
++        return buf;
++    }
++
+     FILE *fp = fopen(path, "rb");
+     if (!fp) { perror("fopen"); return NULL; }
+ 
+@@ -2402,6 +2422,12 @@ int main(int argc, char *argv[])
+         /* The GUI launcher only runs for a plain double-click: no positional
+          * ROM and no automation/headless flag (preserves every scripted dev /
+          * CI invocation in CLAUDE.md). */
++        static char embedded_path[64];
++        if (!rom_path && g_game_spec.embedded_rom && g_game_spec.embedded_rom_size) {
++            snprintf(embedded_path, sizeof embedded_path, EMBEDDED_ROM_PREFIX "%s.bin",
++                     g_game_spec.short_name ? g_game_spec.short_name : "game");
++            rom_path = embedded_path;
++        }
+         int positional_rom = (rom_path != NULL);
+         int automation = (max_frames || hash_frames || hash_on_mode || input_script_path ||
+                           snd_dump_frame || snd_dump_vint || target_fps_cli != 0.0 ||
+-- 
+2.50.1 (Apple Git-155)
+

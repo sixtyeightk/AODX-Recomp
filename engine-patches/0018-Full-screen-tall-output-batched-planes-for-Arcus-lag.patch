@@ -1,0 +1,591 @@
+From a6119245cb83091075eb6b10d5240a9f2a16a78c Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 22:57:24 -0400
+Subject: [PATCH 18/18] Full-screen (tall) output, batched planes for Arcus,
+ lag diagnostic
+
+- Native tall planes: 32 KB VRAM above 64 KB (VDP command A16), 128x64 planes the host marks
+  tall; tall_written tracks which memory each map plane's name table was last written in
+  (whole-table rewrites switch back, overlays are mirrored into the tall plane).
+- gvdp_set_tall / gvdp_set_tall_planes / gvdp_render_scanline_ex: fixed output height with
+  extra rows above and below the raster, the bottom window band moved to the last rows,
+  sprite masking ignored and sprites cleared under the moved window; letterboxed otherwise.
+- genesis_switch_docked(); VRAM dumps append tall VRAM, VSRAM, registers and tall state.
+- GENESIS_LAG_ADDR dev lag-frame counter; input scripts up to 16384 directives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EUc3W7pjjt53fhDNSnaeF9
+---
+ runner/input_script.c          |   2 +-
+ runner/main.c                  |   7 ++
+ runner/platform_switch.c       |   5 ++
+ runner/platform_switch.h       |   2 +
+ runner/rb_state.c              |   4 +-
+ runner/video/genesis_machine.c |  78 ++++++++++++++++-
+ runner/video/genesis_vdp.c     | 156 +++++++++++++++++++++++++++++----
+ runner/video/genesis_vdp.h     |  36 +++++++-
+ 8 files changed, 265 insertions(+), 25 deletions(-)
+
+diff --git a/runner/input_script.c b/runner/input_script.c
+index 3bc27b9..f308339 100644
+--- a/runner/input_script.c
++++ b/runner/input_script.c
+@@ -57,7 +57,7 @@ typedef struct {
+ 
+ /* ---- State ---- */
+ 
+-#define MAX_OPS 4096
++#define MAX_OPS 16384
+ #define SCRIPT_PLAYERS 6
+ static ScriptOp s_ops[MAX_OPS];
+ static int      s_op_count = 0;
+diff --git a/runner/main.c b/runner/main.c
+index 42c9ef3..3e490f0 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -1452,6 +1452,13 @@ static int runner_dump_vram_file(const char *path)
+ 
+     size_t wrote = fwrite(g_machine.vdp.vram, 1, 0x10000, df);
+     int ok = (wrote == 0x10000) && !ferror(df);
++    /* Then the tall-plane VRAM, VSRAM (host-endian words), the
++     * registers and the tall-plane mask (64 KB readers ignore the tail). */
++    fwrite(g_machine.vdp.vram_tall, 1, sizeof g_machine.vdp.vram_tall, df);
++    fwrite(g_machine.vdp.vsram, 1, sizeof g_machine.vdp.vsram, df);
++    fwrite(g_machine.vdp.reg, 1, sizeof g_machine.vdp.reg, df);
++    { uint8_t mask = (uint8_t)gvdp_tall_planes(); fwrite(&mask, 1, 1, df); }
++    fwrite(&g_machine.vdp.tall_written, 1, 1, df);
+     fclose(df);
+ 
+     if (ok)
+diff --git a/runner/platform_switch.c b/runner/platform_switch.c
+index 1b3495a..9eaee8f 100644
+--- a/runner/platform_switch.c
++++ b/runner/platform_switch.c
+@@ -93,6 +93,11 @@ void genesis_switch_init(void)
+             appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld");
+ }
+ 
++int genesis_switch_docked(void)
++{
++    return appletGetOperationMode() == AppletOperationMode_Console;
++}
++
+ int genesis_switch_frame(void)
+ {
+     int paused = 0;
+diff --git a/runner/platform_switch.h b/runner/platform_switch.h
+index 8094bbf..bbc8351 100644
+--- a/runner/platform_switch.h
++++ b/runner/platform_switch.h
+@@ -36,6 +36,8 @@ void genesis_switch_init(void);
+  * device (audren can come back silent otherwise). Returns 0 when the system
+  * asked the app to exit (an SDL_QUIT is queued as well), else 1. */
+ int genesis_switch_frame(void);
++/* 1 while the console is docked (TV output), 0 in handheld mode. */
++int genesis_switch_docked(void);
+ #endif
+ 
+ #endif /* RUNNER_PLATFORM_SWITCH_H */
+diff --git a/runner/rb_state.c b/runner/rb_state.c
+index d8ed35b..9d378f9 100644
+--- a/runner/rb_state.c
++++ b/runner/rb_state.c
+@@ -32,9 +32,9 @@ _Static_assert(sizeof(AudioEvent) == 8, "AudioEvent changed: review audio_event_
+ _Static_assert(sizeof(g_ram) == 0x10000, "work RAM size changed");
+ #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu
+ /* 64-bit layouts (the host pointers inside are scrubbed by machine_rb_save). */
+-_Static_assert(sizeof(GVDP) == 65824, "GVDP changed: review machine_rb_save (pointers) and rb_state");
++_Static_assert(sizeof(GVDP) == 65824 + GVDP_TALL_BYTES, "GVDP changed: review machine_rb_save (pointers) and rb_state");
+ _Static_assert(sizeof(GenesisBus) == 24664, "GenesisBus changed: review machine_rb_save and rb_state");
+-_Static_assert(sizeof(GenesisMachine) == 90576, "GenesisMachine changed: review machine_rb_save and rb_state");
++_Static_assert(sizeof(GenesisMachine) == 90576 + GVDP_TALL_BYTES, "GenesisMachine changed: review machine_rb_save and rb_state");
+ #endif
+ 
+ /* ---- sections ---------------------------------------------------------------- */
+diff --git a/runner/video/genesis_machine.c b/runner/video/genesis_machine.c
+index 4ec995a..c45d8d1 100644
+--- a/runner/video/genesis_machine.c
++++ b/runner/video/genesis_machine.c
+@@ -10,6 +10,7 @@
+ #include "genesis_dac.h"  /* authentic Genesis output-DAC color ladder */
+ #include "chip_trace.h"   /* [CHIP-TRACE] shared FM/PSG stream ring + g_snd_* globals */
+ #include <string.h>
++#include <stdlib.h>
+ #include <stdio.h>   /* [SND-TRACE] temporary sound-command lifecycle trace */
+ 
+ GenesisMachine g_machine;
+@@ -466,12 +467,68 @@ static void step_z80(GenesisMachine *m, uint32_t target)
+ #endif
+ }
+ 
++static uint8_t  s_idxbuf[GVDP_MAX_WIDTH];
++static uint32_t s_rowbuf[GVDP_MAX_WIDTH];
++
++/* Render plane/sprite row `line` (window row `win_line`) and emit it as output row `out`. */
++static void emit_row(GenesisMachine *m, GenesisScanlineSink sink, void *user,
++                     int line, int win_line, int out)
++{
++    int n = gvdp_render_scanline_ex(&m->vdp, line, win_line, s_idxbuf);
++    const uint32_t *host_palette = gvdp_host_palette();
++    if (host_palette)
++        memcpy(s_cram_argb + GVDP_HOST_PALETTE_BASE, host_palette,
++               GVDP_HOST_PALETTE_SIZE * sizeof(uint32_t));
++    else if (gvdp_ext_active())          /* extended sprite lines, per row (water) */
++        for (int k = 0; k < GVDP_EXT_LINES * 16; k++)
++            s_cram_argb[GVDP_HOST_PALETTE_BASE + k] =
++                bgr9_to_argb(gvdp_ext_color(line, 1 + k / 16, k % 16), 0);
++    for (int x = 0; x < n; x++) s_rowbuf[x] = s_cram_argb[s_idxbuf[x]];
++    sink(user, out, s_rowbuf, n);
++}
++
++static void emit_black(GenesisMachine *m, GenesisScanlineSink sink, void *user, int out)
++{
++    int n = gvdp_active_width(&m->vdp);
++    for (int x = 0; x < n; x++) s_rowbuf[x] = 0xFF000000u;
++    sink(user, out, s_rowbuf, n);
++}
++
++/* Tall output (gvdp_set_tall, native extension): emit raster line `line` and,
++ * around it, the extra rows. Frames with tall planes show the map above line 0
++ * and below the last line, with the bottom window band (the HUD) moved to the
++ * last output rows; other frames are centred between black rows. */
++static void emit_tall(GenesisMachine *m, GenesisScanlineSink sink, void *user,
++                      int line, int active_h)
++{
++    int H = gvdp_tall_height();
++    if (!gvdp_tall_rows()) {
++        int pad = (H - active_h) / 2;
++        if (line == 0) for (int o = 0; o < pad; o++) emit_black(m, sink, user, o);
++        emit_row(m, sink, user, line, line, line + pad);
++        if (line == active_h - 1)
++            for (int o = pad + active_h; o < H; o++) emit_black(m, sink, user, o);
++        return;
++    }
++    int T = gvdp_tall_top();
++    unsigned wy = m->vdp.reg[0x12];
++    int hud = (wy & 0x80) ? active_h - (int)(wy & 0x1F) * 8 : 0;   /* window band at the bottom */
++    if (hud < 0) hud = 0;
++    int first = line == 0 ? -T : line;
++    int last = line == active_h - 1 ? H - T - 1 : line;
++    for (int g = first; g <= last; g++) {
++        int o = g + T;
++        int win = !hud ? g : (o >= H - hud ? active_h - hud + (o - (H - hud)) : -1);
++        emit_row(m, sink, user, g, win, o);
++    }
++}
++
+ void machine_run_frame(GenesisScanlineSink sink, void *user)
+ {
+     GenesisMachine *m = &g_machine;
+     int active_h = gvdp_screen_height(&m->vdp);
+-    static uint8_t  idxbuf[GVDP_MAX_WIDTH];
+-    static uint32_t rowbuf[GVDP_MAX_WIDTH];
++    uint8_t  *idxbuf = s_idxbuf;
++    uint32_t *rowbuf = s_rowbuf;
+ 
+     for (int line = 0; line < LINES_TOTAL; line++) {
+         unsigned irq = gvdp_begin_scanline(&m->vdp, line);
+@@ -544,6 +601,10 @@ void machine_run_frame(GenesisScanlineSink sink, void *user)
+                     gvdp_evaluate_scanline(&m->vdp, row);
+                     continue;
+                 }
++                if (gvdp_tall_height() > active_h && !dbl) {
++                    emit_tall(m, sink, user, line, active_h);
++                    continue;
++                }
+                 int n = gvdp_render_scanline(&m->vdp, row, idxbuf);
+                 const uint32_t *host_palette = gvdp_host_palette();
+                 if (host_palette)
+@@ -561,4 +622,17 @@ void machine_run_frame(GenesisScanlineSink sink, void *user)
+         m->master_cycle += MASTER_PER_LINE;
+     }
+     g_snd_frame++;   /* [SND-TRACE] */
++    {   /* Dev diagnostic, GENESIS_LAG_ADDR=<hex RAM address>: a byte the game's main loop
++         * changes every iteration; a frame where it did not change is a lag frame. */
++        extern uint8_t glue_peek8(uint32_t addr);
++        static long addr = -2; static unsigned long frames, lag; static uint8_t last;
++        if (addr == -2) { const char *e = getenv("GENESIS_LAG_ADDR"); addr = e ? strtol(e, 0, 16) : -1; }
++        if (addr >= 0) {
++            uint8_t now = glue_peek8((uint32_t)addr);
++            frames++;
++            if (now == last) lag++;
++            last = now;
++            if (frames % 600 == 0) fprintf(stderr, "[lag] frames=%lu lag=%lu\n", frames, lag);
++        }
++    }
+ }
+diff --git a/runner/video/genesis_vdp.c b/runner/video/genesis_vdp.c
+index 89ccc17..b0f84c1 100644
+--- a/runner/video/genesis_vdp.c
++++ b/runner/video/genesis_vdp.c
+@@ -142,6 +142,22 @@ static void evt_push(const GVDP *v, uint8_t kind, uint8_t code, uint16_t addr,
+     e->src       = src;
+ }
+ 
++/* ---- Tall output (native extension; presentation, not VDP state) ---------- */
++static int s_tall_h, s_tall_top;
++static unsigned s_tall_planes;
++void gvdp_set_tall(int out_h, int top)
++{
++    if (out_h > GVDP_MAX_HEIGHT * 2) out_h = GVDP_MAX_HEIGHT * 2;
++    s_tall_h = out_h > 0 ? out_h : 0;
++    s_tall_top = top > 0 ? top : 0;
++}
++void gvdp_set_tall_planes(unsigned mask) { s_tall_planes = s_tall_h ? (mask & 15u) : 0; }
++/* Frames that show the extra rows (and move the HUD): tall planes, not letterboxed. */
++int gvdp_tall_rows(void) { return (s_tall_planes & 3u) && !(s_tall_planes & 8u); }
++int gvdp_tall_height(void) { return s_tall_h; }
++int gvdp_tall_top(void) { return s_tall_top; }
++unsigned gvdp_tall_planes(void) { return s_tall_planes; }
++
+ /* ---- Geometry / mode queries ---------------------------------------------- */
+ int gvdp_screen_width(const GVDP *v)  { return MODE4_H40(v) ? 320 : 256; }
+ int gvdp_screen_height(const GVDP *v) { return MODE2_V30(v) ? 240 : 224; }
+@@ -151,12 +167,44 @@ int gvdp_display_enabled(const GVDP *v){ return MODE2_DISPLAY_ON(v) ? 1 : 0; }
+  * line). gvdp_screen_height stays the RASTER height (raster timing, H-int,
+  * V-int are unchanged by interlace). */
+ int gvdp_interlace_double(const GVDP *v){ return MODE4_IM2(v) ? 1 : 0; }
+-int gvdp_output_height(const GVDP *v) { return gvdp_screen_height(v) << gvdp_interlace_double(v); }
++int gvdp_output_height(const GVDP *v)
++{
++    int h = gvdp_screen_height(v) << gvdp_interlace_double(v);
++    return s_tall_h > h ? s_tall_h : h;
++}
+ 
+ /* ---- VRAM/CRAM/VSRAM word access ------------------------------------------ */
+ /* VRAM word write carries the documented byte-swap on odd addresses. */
++static void tall_write_word(GVDP *v, uint16_t addr, uint16_t value);
++static uint16_t vram_read_word(const GVDP *v, uint16_t addr);
++
++/* A normal-VRAM write into a map plane's name table ($C000 plane A / $E000 plane B, 64x32)
++ * while that plane is tall. A write at the table's first word starts a clear or a whole new
++ * table (e.g. a boss backdrop): the plane is normal again. Any other write is an overlay
++ * (a banner over the map): mirror it into the tall plane at the cell that shows at the same
++ * screen position under the current scroll, so it lands on top of the map as on hardware. */
++static void note_normal_nt_write(GVDP *v, uint16_t addr, uint16_t value)
++{
++    unsigned plane = (addr & 0xF000) == 0xC000 ? 0 : (addr & 0xF000) == 0xE000 ? 1 : 2;
++    if (plane > 1 || !(v->tall_written & (1u << plane))) return;
++    unsigned off = addr & 0x0FFF;
++    if (off < 2) { v->tall_written &= (uint8_t)~(1u << plane); return; }
++    int row = (int)(off >> 7), col = (int)((off & 0x7F) >> 1);
++    int vs = v->vsram[plane] & 0x3FF;
++    uint16_t hbase = (uint16_t)((REG_HSCROLL_NT(v) & 0x3F) << 10);
++    int hs = vram_read_word(v, (uint16_t)(hbase + plane * 2)) & 0x3FF;
++    int top = vs >> 3, left = ((-hs) & 0x3FF) >> 3;      /* cells at screen (0, 0) */
++    int dr = (row - top) & 31, dc = (col - left) & 63;
++    if (dc >= 56) dc -= 64;                              /* just left of the screen */
++    int trow = (top + dr) & 63, tcol = (left + dc) & 127;
++    unsigned toff = (plane ? GVDP_TALL_PLANE_B : GVDP_TALL_PLANE_A) - GVDP_TALL_BASE
++                    + (unsigned)(trow * 256 + tcol * 2);
++    tall_write_word(v, (uint16_t)toff, (uint16_t)((addr & 1) ? (value << 8 | value >> 8) : value));
++}
++
+ static void vram_write_word(GVDP *v, uint16_t addr, uint16_t value)
+ {
++    note_normal_nt_write(v, addr, value);
+     uint16_t a = addr & 0xFFFE;
+     if (addr & 1) { v->vram[a] = (uint8_t)value; v->vram[(uint16_t)(a + 1)] = (uint8_t)(value >> 8); }
+     else          { v->vram[a] = (uint8_t)(value >> 8); v->vram[(uint16_t)(a + 1)] = (uint8_t)value; }
+@@ -168,6 +216,26 @@ static uint16_t vram_read_word(const GVDP *v, uint16_t addr)
+     return (uint16_t)((v->vram[a] << 8) | v->vram[(uint16_t)(a + 1)]);
+ }
+ 
++/* Native tall-plane VRAM (A16 set): only $10000-$17FFF exists; other A16
++ * addresses read 0 and ignore writes. */
++static void tall_write_word(GVDP *v, uint16_t addr, uint16_t value)
++{
++    unsigned a = (unsigned)(addr & 0xFFFE);      /* offset from $10000 */
++    if (a >= GVDP_TALL_BYTES) return;
++    v->tall_written |= a < (GVDP_TALL_PLANE_B - GVDP_TALL_BASE) ? 1u : 2u;
++    if (addr & 1) { v->vram_tall[a] = (uint8_t)value; v->vram_tall[a + 1] = (uint8_t)(value >> 8); }
++    else          { v->vram_tall[a] = (uint8_t)(value >> 8); v->vram_tall[a + 1] = (uint8_t)value; }
++}
++
++/* Name-table word at a 17-bit address (bit 16 = tall VRAM). */
++static inline uint16_t nt_read_word(const GVDP *v, uint32_t addr)
++{
++    if (!(addr & 0x10000)) return vram_read_word(v, (uint16_t)addr);
++    uint32_t a = (addr & 0x1FFFE) - GVDP_TALL_BASE;
++    if (a >= GVDP_TALL_BYTES) return 0;
++    return (uint16_t)((v->vram_tall[a] << 8) | v->vram_tall[a + 1]);
++}
++
+ static void cram_write(GVDP *v, uint16_t addr, uint16_t value)
+ {
+     unsigned idx = (addr >> 1) & (GVDP_CRAM_ENTRIES - 1);
+@@ -267,6 +335,7 @@ static void dma_run_vram_copy(GVDP *v)
+     uint32_t len = dma_length(v);
+     uint16_t src = (uint16_t)(((uint32_t)REG_DMA_SRC_LO(v)) | ((uint32_t)REG_DMA_SRC_MID(v) << 8));
+     while (len--) {
++        if ((v->address & 0x0FFE) == 0) note_normal_nt_write(v, v->address & 0xFFFE, 0);
+         v->vram[v->address & 0xFFFF] = v->vram[src & 0xFFFF];
+         src = (uint16_t)(src + 1);
+         v->address = (uint16_t)(v->address + REG_AUTOINC(v));
+@@ -283,6 +352,7 @@ static void dma_run_vram_fill_data(GVDP *v, uint16_t value)
+     vram_write_word(v, v->address, value);
+     v->address = (uint16_t)(v->address + REG_AUTOINC(v));
+     while (len--) {
++        if ((v->address & 0x0FFE) == 0) note_normal_nt_write(v, v->address & 0xFFFE, 0);
+         v->vram[(v->address ^ 1) & 0xFFFF] = fill;
+         v->address = (uint16_t)(v->address + REG_AUTOINC(v));
+     }
+@@ -340,11 +410,13 @@ void gvdp_write_control(GVDP *v, uint16_t value)
+         /* First half of an address/code set. */
+         v->address = (uint16_t)((v->address & 0xC000) | (value & 0x3FFF));
+         v->code = (uint8_t)((v->code & 0x3C) | ((value >> 14) & 0x03));
++        v->address_hi = 0;          /* tall VRAM only through a full command with A16 */
+         v->control_pending = 1;
+     } else {
+         /* Second half: A15-A14 in bits 1-0, CD5-CD2 in bits 7-4. */
+         v->address = (uint16_t)((v->address & 0x3FFF) | ((value & 0x0003) << 14));
+         v->code = (uint8_t)((v->code & 0x03) | ((value >> 2) & 0x3C));
++        v->address_hi = (uint8_t)((value >> 2) & 1);   /* A16 (128 KB mode): native tall VRAM */
+         v->control_pending = 0;
+         evt_push(v, GVDP_EVT_CMD, v->code, v->address, value, REG_AUTOINC(v), 0, 0, 0);
+         maybe_start_dma(v);
+@@ -359,7 +431,10 @@ void gvdp_write_data(GVDP *v, uint16_t value)
+     if (v->dma_fill_pending) { dma_run_vram_fill_data(v, value); return; }
+ 
+     switch (v->code & 0x0F) {
+-        case CODE_VRAM_WRITE:  vram_write_word(v, v->address, value); break;
++        case CODE_VRAM_WRITE:
++            if (v->address_hi) tall_write_word(v, v->address, value);
++            else vram_write_word(v, v->address, value);
++            break;
+         case CODE_CRAM_WRITE:  cram_write(v, v->address, value);      break;
+         case CODE_VSRAM_WRITE: vsram_write(v, v->address, value);     break;
+         default:               vram_write_word(v, v->address, value); break;
+@@ -691,7 +766,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
+ 
+             /* Sprite masking: an x==0 sprite after another on-line sprite
+              * masks the rest of the line. */
+-            if (xword == 0 && on_line > 1) break;
++            if (xword == 0 && on_line > 1 && !gvdp_tall_rows()) break;   /* tall: see render */
+ 
+             int tile = attr & 0x07FF;
+             int pal  = (attr >> 13) & 0x3;
+@@ -811,7 +886,7 @@ typedef struct PlanePixelCache {
+ #endif
+ static GVDP_HOT_INLINE void
+ fetch_plane_pixel(const GVDP *v, PlanePixelCache *cache,
+-                  uint16_t base, int wt, int ht,
++                  uint32_t base, int wt, int ht,
+                   int px, int py, int im2,
+                   uint8_t *idx, int *opaque, int *hi)
+ {
+@@ -825,8 +900,9 @@ fetch_plane_pixel(const GVDP *v, PlanePixelCache *cache,
+     if (cache->next_coord == coord) {
+         e = cache->attr;
+     } else {
+-        uint16_t nt = (uint16_t)(base + (uint16_t)(((py >> cell_h_shift) * wt + (px >> 3)) * 2));
+-        e = vram_read_word(v, nt);
++        uint32_t off = (uint32_t)(((py >> cell_h_shift) * wt + (px >> 3)) * 2);
++        uint32_t nt = (base & 0x10000) ? base + off : (uint16_t)(base + off);
++        e = nt_read_word(v, nt);
+         cache->attr = e;
+     }
+     /* Reuse is valid only for the immediately adjacent pixel within this
+@@ -854,17 +930,20 @@ fetch_plane_pixel(const GVDP *v, PlanePixelCache *cache,
+  * This cache is local to one stable-VRAM scanline, so no invalidation protocol
+  * or additional serialized device state is needed. */
+ static void fetch_plane_span(const GVDP *v, uint8_t *out, int count,
+-                             uint16_t base, int wt, int ht, int px, int py, int im2)
++                             uint32_t base, int wt, int ht, int px, int py, int im2)
+ {
+     int shift = im2 ? 4 : 3, fy_mask = (1 << shift) - 1;
+     int tile_bytes = im2 ? 64 : 32, mask = wt * 8 - 1;
+     py &= (ht << shift) - 1;
+-    uint16_t row_base = (uint16_t)(base + (py >> shift) * wt * 2);
++    uint32_t row_off = (uint32_t)((py >> shift) * wt * 2);
++    uint32_t row_base = (base & 0x10000) ? base + row_off : (uint16_t)(base + row_off);
+     while (count) {
+         px &= mask;
+         int fx = px & 7, n = 8 - fx;
+         if (n > count) n = count;
+-        uint16_t e = vram_read_word(v, (uint16_t)(row_base + (px >> 3) * 2));
++        uint32_t ea = (row_base & 0x10000) ? row_base + (uint32_t)((px >> 3) * 2)
++                                           : (uint16_t)(row_base + (px >> 3) * 2);
++        uint16_t e = nt_read_word(v, ea);
+         int fy = py & fy_mask;
+         if (e & 0x1000) fy ^= fy_mask;
+         uint16_t pa = (uint16_t)((e & 0x7ff) * tile_bytes + fy * 4);
+@@ -888,6 +967,11 @@ static void fetch_plane_span(const GVDP *v, uint8_t *out, int count,
+  * use the raster line; plane/sprite vertical addressing runs in double-res
+  * space with 8x16 cells. */
+ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
++{
++    return gvdp_render_scanline_ex(v, line, line, out);
++}
++
++int gvdp_render_scanline_ex(GVDP *v, int line, int win_line, uint8_t *out)
+ {
+     int w = gvdp_screen_width(v);
+     int content_extra = clamp_ws_extra(w);  /* genuine widened content per side; 0 = authentic */
+@@ -900,6 +984,12 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
+     int offset = pillar + content_extra;           /* output col that screen col 0 maps to */
+     int im2 = MODE4_IM2(v);
+     int rline = im2 ? (line >> 1) : line;   /* raster line for table lookups */
++    /* Tall output rows lie outside the raster: tables use the nearest raster line. */
++    int raster_h = gvdp_screen_height(v);
++    int outside = rline < 0 || rline >= raster_h;
++    if (rline < 0) rline = 0;
++    if (rline >= raster_h) rline = raster_h - 1;
++    int wline = win_line < 0 ? -1 : (im2 ? (win_line >> 1) : win_line);
+     uint8_t backdrop = (uint8_t)(REG_BACKDROP(v) & 0x3F);
+     /* Pillarbox bar fill: per-scanline backdrop (seamless) or the black
+      * sentinel the host maps to opaque black. */
+@@ -918,8 +1008,17 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
+     /* Plane geometry. */
+     int wt = plane_tiles(REG_PLANE_SIZE(v) & 0x3);
+     int ht = plane_tiles((REG_PLANE_SIZE(v) >> 4) & 0x3);
+-    uint16_t base_a = (uint16_t)((REG_PLANEA_NT(v) & 0x38) << 10);
+-    uint16_t base_b = (uint16_t)((REG_PLANEB_NT(v) & 0x07) << 13);
++    uint32_t base_a = (uint32_t)((REG_PLANEA_NT(v) & 0x38) << 10);
++    uint32_t base_b = (uint32_t)((REG_PLANEB_NT(v) & 0x07) << 13);
++    /* Tall planes (native extension): 64 rows, name table in vram_tall. */
++    int ht_a = ht, ht_b = ht, wt_a = wt, wt_b = wt;
++    /* A plane is tall when the host allows it and its name table was last written in the
++     * tall VRAM (plane A reading plane B's table follows plane B's). */
++    if ((s_tall_planes & 1) && (v->tall_written & ((s_tall_planes & 4) ? 2u : 1u))) {
++        base_a = (s_tall_planes & 4) ? GVDP_TALL_PLANE_B : GVDP_TALL_PLANE_A;
++        wt_a = 128; ht_a = 64;
++    }
++    if ((s_tall_planes & 2) && (v->tall_written & 2u)) { base_b = GVDP_TALL_PLANE_B; wt_b = 128; ht_b = 64; }
+     int win_wt = MODE4_H40(v) ? 64 : 32;
+     uint16_t base_w = MODE4_H40(v) ? (uint16_t)((REG_WINDOW_NT(v) & 0x3E) << 10)
+                                    : (uint16_t)((REG_WINDOW_NT(v) & 0x3F) << 10);
+@@ -946,16 +1045,35 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
+     int window_x = (wx & 0x1F) * 16;
+     int window_y = (wy & 0x1F) * 8;
+     int window_h_right = (wx & 0x80) != 0;
+-    int window_v_in = (wy & 0x80) ? (rline >= window_y) : (rline < window_y);
++    int window_v_in = wline < 0 ? 0 : (wy & 0x80) ? (wline >= window_y) : (wline < window_y);
+     int sh_mode = MODE4_SHI(v) != 0;
+ 
+     /* Sprite layer for this output row (placed in centered output-column space). */
+-    sprite_render_line(v, line, total, offset);
++    /* Tall frames move the HUD (the bottom window band) to the last output rows. The game
++     * keeps sprites off its HUD with a sprite mask (an x = 0 sprite over the window lines);
++     * that mask now sits in open playfield, so tall frames ignore masking (sprite_render_line)
++     * and instead clear sprite pixels wherever the moved window covers the row (below). */
++    if (outside) {
++        /* Presentation-only row: keep the guest-visible sprite status bits. */
++        uint8_t ov = v->sprite_overflow, co = v->sprite_collision;
++        sprite_render_line(v, line, total, offset);
++        v->sprite_overflow = ov; v->sprite_collision = co;
++    } else {
++        sprite_render_line(v, line, total, offset);
++    }
+     if (s_host_sprites) {
+         GVDPSpriteLayer layer = { line, total, offset, s_spr_idx, s_spr_op, s_spr_hi };
+         s_host_sprites(s_host_sprites_user, v, &layer);
+     }
+ 
++    if (gvdp_tall_rows() && win_line >= 0 && win_line != line && window_v_in) {
++        int x0 = offset, x1 = offset + w;
++        if (x0 < 0) x0 = 0;
++        if (x1 > total) x1 = total;
++        for (int xo = x0; xo < x1; xo++)
++            s_spr_op[xo] = s_spr_shadow_op[xo] = s_spr_hilite_op[xo] = 0;
++    }
++
+     /* A name-table entry covers eight adjacent pixels and each pattern byte
+      * covers two. Rendering runs after the line's CPU/Z80 slice, so VRAM
+      * cannot change underneath this row; keep separate caches for A, B, and
+@@ -979,11 +1097,11 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
+         }
+         int window_h_in = window_h_right ? x >= window_x : x < window_x;
+         if (x >= 0 && x < w && (window_h_in || window_v_in))
+-            fetch_plane_span(v, plane_a + xo, n, base_w, win_wt, ht, x, line, im2);
++            fetch_plane_span(v, plane_a + xo, n, base_w, win_wt, ht, x, win_line, im2);
+         else
+-            fetch_plane_span(v, plane_a + xo, n, base_a, wt, ht,
++            fetch_plane_span(v, plane_a + xo, n, base_a, wt_a, ht_a,
+                              x - hs_a, line + vs_a, im2);
+-        fetch_plane_span(v, plane_b + xo, n, base_b, wt, ht,
++        fetch_plane_span(v, plane_b + xo, n, base_b, wt_b, ht_b,
+                          x - hs_b, line + vs_b, im2);
+         x += n; xo += n;
+     }
+@@ -1025,13 +1143,13 @@ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out)
+         int window_h_in = window_h_right ? (x >= window_x) : (x < window_x);
+         if (x >= 0 && x < w && (window_h_in || window_v_in)) {
+             fetch_plane_pixel(v, &cache_w, base_w, win_wt, ht,
+-                              x, line, im2, &a_idx, &a_op, &a_hi);
++                              x, win_line, im2, &a_idx, &a_op, &a_hi);
+         } else {
+-            fetch_plane_pixel(v, &cache_a, base_a, wt, ht,
++            fetch_plane_pixel(v, &cache_a, base_a, wt_a, ht_a,
+                               (x - hs_a), (line + vs_a), im2, &a_idx, &a_op, &a_hi);
+         }
+         /* Plane B. */
+-        fetch_plane_pixel(v, &cache_b, base_b, wt, ht,
++        fetch_plane_pixel(v, &cache_b, base_b, wt_b, ht_b,
+                           (x - hs_b), (line + vs_b), im2, &b_idx, &b_op, &b_hi);
+ #endif
+ 
+diff --git a/runner/video/genesis_vdp.h b/runner/video/genesis_vdp.h
+index 02f46cb..853c0a2 100644
+--- a/runner/video/genesis_vdp.h
++++ b/runner/video/genesis_vdp.h
+@@ -30,7 +30,11 @@
+ #define GVDP_VSRAM_ENTRIES  40                 /* 40 scroll words (16-bit MD)  */
+ #define GVDP_NUM_REGISTERS  24                 /* $00..$17                     */
+ #define GVDP_MAX_WIDTH      512                /* H40 320 + up to 96px widescreen margin/side */
+-#define GVDP_MAX_HEIGHT     240                /* V30 active lines (PAL)       */
++#define GVDP_MAX_HEIGHT     240
++#define GVDP_TALL_BASE      0x10000            /* native tall-plane VRAM       */
++#define GVDP_TALL_BYTES     0x8000             /* two 128x64 planes            */
++#define GVDP_TALL_PLANE_A   0x10000
++#define GVDP_TALL_PLANE_B   0x14000                /* V30 active lines (PAL)       */
+ #define GVDP_SPRITES_MAX    80                 /* H40 sprite table entries     */
+ 
+ /* CRAM index space the scanline callback emits: 64 colours * 3 brightnesses
+@@ -66,6 +70,15 @@ typedef void (*GVDP_ColourUpdated)(void *user, unsigned index, uint16_t bgr9);
+ typedef struct GVDP {
+     /* Memories */
+     uint8_t  vram[GVDP_VRAM_SIZE];
++    /* Native extension (no hardware equivalent): VRAM above 64 KB for "tall"
++     * 128x64 planes, written by commands with the 128 KB-mode address bit
++     * (second control word bit 2 = A16) and read only by planes the host marks
++     * tall (gvdp_set_tall_planes): plane A at $10000, plane B at $14000. */
++    uint8_t  vram_tall[GVDP_TALL_BYTES];
++    /* Which memory each map plane's name table was last written in: bit 0 = plane A
++     * ($C000 region / tall $10000), bit 1 = plane B ($E000 / tall $14000); set by a tall
++     * write, cleared by a normal one (e.g. a DMA'd boss backdrop after the level start). */
++    uint8_t  tall_written;
+     uint16_t cram[GVDP_CRAM_ENTRIES];          /* stored as 9-bit BGR          */
+     uint16_t vsram[GVDP_VSRAM_ENTRIES];
+ 
+@@ -265,6 +278,27 @@ int gvdp_output_height(const GVDP *v);          /* raster height x2 in IM2     *
+  * for shadow/highlight offsets). `out` must hold at least gvdp_screen_width()
+  * entries. Returns the number of pixels written. */
+ int gvdp_render_scanline(GVDP *v, int line, uint8_t *out);
++/* As above with the window plane addressed separately: `line` drives the planes
++ * and sprites (it may lie outside the raster, for tall output rows), `win_line`
++ * the window plane's rows and vertical extent (-1 = no window on this row).
++ * Rows outside the raster leave the guest-visible sprite status untouched. */
++int gvdp_render_scanline_ex(GVDP *v, int line, int win_line, uint8_t *out);
++
++/* ---- Tall output (native extension, presentation) ------------------------- */
++/* Arm a fixed output height `out_h` (> raster height; 0 = off). Frames whose
++ * planes are marked tall show `top` extra plane rows above raster line 0 and the
++ * rest below line 223, with the bottom window band (the HUD) moved to the last
++ * output rows; other frames centre the raster and pad with black rows. Planes
++ * marked tall (bit 0 = A, bit 1 = B; set by the host each frame) are 128x64 and
++ * read their name table from vram_tall (GVDP_TALL_PLANE_A/B; bit 2 = plane A reads
++ * plane B's, for a game that points both planes at one name table; bit 3 = tall
++ * planes but a letterboxed frame). NOT VDP state. */
++void gvdp_set_tall(int out_h, int top);
++void gvdp_set_tall_planes(unsigned mask);
++int  gvdp_tall_height(void);                    /* armed height, 0 = off       */
++int  gvdp_tall_top(void);
++unsigned gvdp_tall_planes(void);
++int  gvdp_tall_rows(void);                      /* this frame shows the extra rows */
+ /* Run the guest-visible sprite evaluation for a discarded output row. Uses
+  * exactly the renderer's sprite limits, pattern reads and collision rules;
+  * background fetch/composition and host drawing have no device side effects.
+-- 
+2.50.1 (Apple Git-155)
+

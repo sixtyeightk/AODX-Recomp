@@ -1,0 +1,65 @@
+From 1cc99415446ea6a14e382448e5fbd8678d279bda Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:24:30 -0400
+Subject: [PATCH 07/18] E9: allow a prebuilt host recompiler for cross builds
+
+When cross-compiling (Nintendo Switch via devkitA64's Switch.cmake), the
+GenesisRecomp built by add_subdirectory would be a target binary that cannot
+run during the build. GENESISRECOMP_EXECUTABLE names a recompiler built for
+the build machine; it is imported as the GenesisRecomp target and used by the
+generated-sources step. Cross builds without it fail at configure time with a
+clear message. Native builds are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/GenesisRecompGenerated.cmake | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/cmake/GenesisRecompGenerated.cmake b/cmake/GenesisRecompGenerated.cmake
+index 40ed086..74bbc73 100644
+--- a/cmake/GenesisRecompGenerated.cmake
++++ b/cmake/GenesisRecompGenerated.cmake
+@@ -17,9 +17,29 @@ if(NOT DEFINED RECOMP_ROOT)
+     message(FATAL_ERROR "RECOMP_ROOT must name the segagenesisrecomp checkout")
+ endif()
+ 
++# Cross builds (e.g. Nintendo Switch) cannot run a recompiler compiled for the
++# target. Point GENESISRECOMP_EXECUTABLE at a GenesisRecomp built for the build
++# machine; it is then imported instead of built here. Native builds leave it
++# empty and build the recompiler as before.
++set(GENESISRECOMP_EXECUTABLE "" CACHE FILEPATH
++    "Prebuilt host GenesisRecomp (required when cross-compiling)")
+ if(NOT TARGET GenesisRecomp)
+-    add_subdirectory("${RECOMP_ROOT}/recompiler"
+-                     "${CMAKE_BINARY_DIR}/genesis-recompiler")
++    if(GENESISRECOMP_EXECUTABLE)
++        add_executable(GenesisRecomp IMPORTED GLOBAL)
++        set_target_properties(GenesisRecomp PROPERTIES
++            IMPORTED_LOCATION "${GENESISRECOMP_EXECUTABLE}")
++    elseif(CMAKE_CROSSCOMPILING)
++        message(FATAL_ERROR "Cross-compiling: set GENESISRECOMP_EXECUTABLE to a "
++                            "GenesisRecomp built for the build machine")
++    else()
++        add_subdirectory("${RECOMP_ROOT}/recompiler"
++                         "${CMAKE_BINARY_DIR}/genesis-recompiler")
++    endif()
++endif()
++if(GENESISRECOMP_EXECUTABLE)
++    set(_genesisrecomp_dep "${GENESISRECOMP_EXECUTABLE}")
++else()
++    set(_genesisrecomp_dep GenesisRecomp)
+ endif()
+ 
+ function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
+@@ -141,7 +161,7 @@ function(genesisrecomp_add_generated_sources OUT_VAR PREFIX GAME_DIR ROM_NAME)
+         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_stage_unresolved}" "${_unresolved}"
+         COMMAND "${CMAKE_COMMAND}" -E touch "${_stamp}"
+         DEPENDS
+-            GenesisRecomp
++            ${_genesisrecomp_dep}
+             ${_rom_input}
+             "${_game}/game.toml"
+             "${_options_file}"
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,74 @@
+# game.toml — Arcus Odyssey (Wolf Team, 1991), USA NTSC, our patched ROM.
+#
+# Input: ../build/arcus-native.bin (tools/build.py --native), 2 MB file:
+#   $000000-$0FFFFF  original 1 MB game (with call-site patches)
+#   $100000-$1000FF  twin-stick hook (patch/twinstick.asm): jmp table $100000 PadRead, $100006 AimHook
+#   $100400-$10043F  widescreen helpers (patch/widescreen.asm): $100400 MapColFg,
+#                    $100406 MapColBg, $10040C InitAdvance
+#   $100600-          native patches (patch/native.asm): 9-entry jmp table $100600-$100630
+#                    (camera start/edge stops, auto-scroll wrap, 2P bounds, aim release)
+#   rest             $FF padding
+# Vectors: SSP $FFFC00, reset $00020E, V-int $0003D8, H-int $0003DA. Every other
+# exception / TRAP / line-A / line-F vector points at the default handler $000200.
+# No community disassembly: heuristic discovery + runtime evidence (as RKA).
+
+[game]
+output_prefix = "arcus"
+jump_table_autodiscovery = true
+# Executed-PC evidence from tools/coverage.py --mode interp --fold (additive gate: observed code,
+# promoted to functions only where structure proves a boundary).
+runtime_exec_file = "exec_pcs.txt"
+
+[ram_layout]
+game_mode      = 0x000000     # cosmetic; unknown yet
+vint_runcount  = 0x000000
+vint_routine   = 0x000000
+plc_pending    = 0x000000     # no Sonic PLC system
+initial_ssp    = 0xFFFFFC00   # reset SSP (LOAD-BEARING)
+vbla_stack     = 0xFFFFFC00
+intr_stack     = 0xFFFFFC00   # interrupt delivery stack (LOAD-BEARING)
+player_object  = 0x000000
+level_modes    = []
+
+[functions]
+# Entry, V-int, H-int, default exception handler, and our patch entry points.
+extra = [0x00020E, 0x0003D8, 0x0003DA, 0x000200,
+         0x100000, 0x100006, 0x100400, 0x100406, 0x10040C,
+         0x100600, 0x100606, 0x10060C, 0x100612, 0x100618, 0x10061E, 0x100624, 0x10062A,
+         0x100630, 0x100636, 0x10063C, 0x100642, 0x100648,
+         # Save-state resume points (game/arcus_saves.c): the gameplay frame loop's top
+         # $6C7E, $6C86 (the area setup branches there), and its two VBlank waits, the
+         # JSR $1A9E at $6D3C and at $6DF8. A load restarts the game fiber at one of these.
+         0x006C7E, 0x006C86, 0x006D3C, 0x006DF8]
+
+# BEGIN coverage.py late_extra
+# Computed-call targets seen on the interpreter floor, each starting right after a
+# terminator (tools/coverage.py --mode native --fold), plus reviewed starts right after data
+# tables ($00D65C $00D75E $016800 $01B55C: code begins where the table ends).
+late_extra = [
+  0x00D65C, 0x00D75E, 0x011E7A, 0x012082, 0x0120C6, 0x01210C, 0x012156, 0x01219C,
+  0x0121E8, 0x012238, 0x01223A, 0x012286, 0x0122CC, 0x012316, 0x012360, 0x012368,
+  0x012370, 0x012378, 0x0123C6, 0x012410, 0x0124EE, 0x012538, 0x012582, 0x012586,
+  0x0125D2, 0x01261C, 0x012676, 0x0126CA, 0x01271E, 0x012772, 0x0127C6, 0x01280E,
+  0x012856, 0x01289C, 0x0128A2, 0x0128A8, 0x0128AE, 0x0128B4, 0x0128BA, 0x0128C0,
+  0x0128C6, 0x0128CC, 0x0128D2, 0x0128D8, 0x012928, 0x01292E, 0x012934, 0x01293A,
+  0x012940, 0x012946, 0x01294C, 0x012952, 0x012958, 0x012A74, 0x012ABC, 0x012B34,
+  0x012B84, 0x012B9A, 0x012BE2, 0x012C38, 0x012C3A, 0x012C3C, 0x012C8A, 0x012CD0,
+  0x012D1A, 0x012D20, 0x012D26, 0x012D2C, 0x012D84, 0x012DE4, 0x012E32, 0x012E9E,
+  0x012EE6, 0x012EEA, 0x012F32, 0x012F7E, 0x012FCC, 0x013056, 0x01309C, 0x0130F0,
+  0x01313C, 0x013184, 0x0131CE, 0x013214, 0x01325C, 0x0132AA, 0x013300, 0x013356,
+  0x0133B0, 0x013412, 0x013462, 0x0134BE, 0x013508, 0x013552, 0x01359E, 0x0135EA,
+  0x013656, 0x0136A6, 0x0136F4, 0x013788, 0x0137EC, 0x013846, 0x0138A0, 0x0138E8,
+  0x013930, 0x013978, 0x0139BE, 0x013A08, 0x016318, 0x016344, 0x01655C, 0x01670E,
+  0x016800, 0x016898, 0x0169AE, 0x016CB8, 0x0171DA, 0x0172D6, 0x01743E, 0x017756,
+  0x0177B2, 0x01780E, 0x01793E, 0x017C62, 0x017E66, 0x01803E, 0x018058, 0x01826A,
+  0x01847E, 0x01882A, 0x018F6E, 0x019208, 0x01928E, 0x0193FE, 0x019492, 0x0195B4,
+  0x019640, 0x0196B6, 0x019810, 0x019F62, 0x019FB2, 0x01A000, 0x01A05E, 0x01A0BA,
+  0x01A16A, 0x01A218, 0x01A276, 0x01A3AE, 0x01A632, 0x01A68A, 0x01A6E4, 0x01A92E,
+  0x01A982, 0x01A9D8, 0x01AB30, 0x01AB88, 0x01ABA8, 0x01AD9C, 0x01AF92, 0x01B55C,
+  0x01B682, 0x01CED4, 0x01E68E, 0x020DF6, 0x021CD8, 0x021DD8, 0x021DFA, 0x021F76,
+  0x021FE0, 0x022022, 0x022034, 0x022066, 0x0222CC, 0x022326, 0x022342, 0x022458,
+  0x0224DC, 0x022906, 0x022972, 0x022A32, 0x022A74, 0x022A86, 0x025A5E, 0x026A2A,
+  0x026A8C, 0x026AD6
+]
+# END coverage.py late_extra

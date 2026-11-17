@@ -1,0 +1,36 @@
+Subject: [PATCH 19] save_resume_pc without a Game_Mode byte
+
+A game with game_mode = 0 (Arcus: no mode byte) still gets GameSpec.save_resume_pc on a
+state load, with mode 0, so it can choose the resume point from the restored CPU and stack.
+Games with a mode byte are unchanged. Hand-written diff (no git), 2026-11-12.
+---
+--- a/runner/main.c	2026-11-12 10:42:26
++++ b/runner/main.c	2026-11-12 10:42:26
+@@ -1240,9 +1240,11 @@
+          * loop top (moment-in-time) when the game maps one; otherwise fall
+          * back to the outer dispatcher (mode-handler re-entry / reload). */
+         uint32_t resume_pc = g_game_spec.resume_main_loop_pc;
+-        if (g_game_spec.save_resume_pc && g_game_layout.game_mode_addr) {
+-            uint32_t pc = g_game_spec.save_resume_pc(
+-                glue_peek8(g_game_layout.game_mode_addr));
++        /* A game without a Game_Mode byte (game_mode = 0) still gets the hook, with mode 0:
++         * it can tell the resume point from the restored CPU and stack. */
++        if (g_game_spec.save_resume_pc) {
++            uint32_t pc = g_game_spec.save_resume_pc(g_game_layout.game_mode_addr
++                ? glue_peek8(g_game_layout.game_mode_addr) : 0u);
+             if (pc) resume_pc = pc;
+         }
+         if (resume_pc)
+--- a/runner/host_state.h	2026-11-12 10:42:26
++++ b/runner/host_state.h	2026-11-12 10:42:26
+@@ -143,8 +143,8 @@
+     if (!ok) { rewind(backup); host_machine_read(backup); goto done; }
+     audio_discard_playback(); /* host payload restored deferred chip events */
+     uint32_t pc=g_game_spec.resume_main_loop_pc;
+-    if (g_game_spec.save_resume_pc && g_game_layout.game_mode_addr) {
+-        uint32_t mapped=g_game_spec.save_resume_pc(glue_peek8(g_game_layout.game_mode_addr));
++    if (g_game_spec.save_resume_pc) {   /* game_mode 0: the hook gets mode 0 */
++        uint32_t mapped=g_game_spec.save_resume_pc(g_game_layout.game_mode_addr?glue_peek8(g_game_layout.game_mode_addr):0u);
+         if (mapped) pc=mapped;
+     }
+     if (pc) glue_restart_game_fiber(pc);

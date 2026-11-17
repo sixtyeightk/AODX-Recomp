@@ -1,0 +1,181 @@
+From e82d8156e299cb7fa870f097c03db1de03be1225 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 01:32:07 -0400
+Subject: [PATCH 17/18] Raster-accurate H-blank status flag; vsync pacing on
+ Switch; log rotation; cold reset API
+
+- VDP status bit 2 follows the raster position (gvdp_line_cycle_hook: 68K cycles into the
+  line, H-blank from 400 of 488) instead of toggling per read. Games that count H-blank
+  edges to find a line (Arcus Odyssey's intro raster zoom) started their per-line VSRAM
+  writes ~100 lines early. The phantom toggle stays as the no-hook fallback.
+- Switch: when the renderer has vsync, vsync alone paces frames (the software pacer beat
+  against it: ~130 late frames a minute).
+- Switch: keep the previous session's log as log.prev.txt.
+---
+ runner/glue.c              | 13 +++++++++++++
+ runner/main.c              | 13 ++++++++++++-
+ runner/platform_switch.c   |  5 ++++-
+ runner/video/genesis_vdp.c | 25 ++++++++++++++++++-------
+ runner/video/genesis_vdp.h |  6 ++++++
+ 5 files changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/runner/glue.c b/runner/glue.c
+index adb2050..5bc9bed 100644
+--- a/runner/glue.c
++++ b/runner/glue.c
+@@ -704,8 +704,19 @@ static int     s_interleave_active = 0;
+ /* Called from DoCycles (inside Iterate). Runs game code for a chunk. */
+ static cc_u32f s_chunk_cycles = 0;  /* budget for current chunk */
+ 
++static int gvdp_line_cycle_hook_installed;
++/* Raster position for the VDP status H-blank flag (genesis_vdp.h gvdp_line_cycle_hook). */
++static uint32_t s_line_start_cyc;
++static uint32_t glue_line_cycles(void) { return g_audio_cycle_counter - s_line_start_cyc; }
++static void glue_install_line_hook(void)
++{
++    extern uint32_t (*gvdp_line_cycle_hook)(void);
++    gvdp_line_cycle_hook = glue_line_cycles;
++}
++
+ void glue_run_game_chunk(cc_u32f cycles)
+ {
++    if (!gvdp_line_cycle_hook_installed) { gvdp_line_cycle_hook_installed = 1; glue_install_line_hook(); }
+     /* An opt-in quicksave completes the native tick, then keeps its WaitForVint
+      * parked until this wall frame's VDP/Z80/audio drain has completed. */
+     if (s_state_parked) return;
+@@ -747,6 +758,8 @@ void glue_run_game_chunk(cc_u32f cycles)
+     s_main_cpu_stalls = 0;
+     s_cycle_budget = (int32_t)cycles;
+     s_budget_cyc_seen = g_audio_cycle_counter;  /* drain from here (see check_cycle_budget) */
++    /* Line start: this chunk is the line's remainder after any interrupt-handler debt. */
++    s_line_start_cyc = g_audio_cycle_counter - (cycles < 488u ? 488u - (uint32_t)cycles : 0u);
+     s_interleave_active = 1;
+     instruction_watchdog_reset();
+     fiber_switch(s_game_fiber);
+diff --git a/runner/main.c b/runner/main.c
+index 4db3e41..42c9ef3 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -1700,6 +1700,9 @@ static struct {
+ } s_launcher_ctx;
+ 
+ /* ---- cold reset (rematch / offline Play after netplay) -------------------- */
++/* Switch: vsync alone paces presents (see the renderer setup). */
++static int s_vsync_paces;
++
+ static uint8_t *s_cold_blob;
+ static size_t   s_cold_len;
+ 
+@@ -2809,6 +2812,14 @@ int main(int argc, char *argv[])
+                 benchmark_frames ? "GENESISRECOMP_BENCHMARK_RENDERER" : "[VIDEO] renderer",
+                 ri.name ? ri.name : "(unknown)",
+                 (ri.flags & SDL_RENDERER_PRESENTVSYNC) != 0);
++#if GENESIS_PLATFORM_SWITCH
++        /* Switch: the target rate IS the display's 60 Hz, so the vsync present
++         * already paces one frame per refresh. Running the software pacer too
++         * makes two clocks beat: every ~0.5 s a frame waits for both and
++         * misses a refresh (measured: ~130 late frames a minute). */
++        s_vsync_paces = (ri.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
++        if (s_vsync_paces) fprintf(stderr, "[pacer] vsync paces frames (software pacer off)\n");
++#endif
+     }
+     update_render_logical_size(renderer);
+ 
+@@ -3848,7 +3859,7 @@ session_begin:;
+          * after present only paces frame starts: variable simulation/upload
+          * time then moves each present and makes scrolling judder. The guest
+          * still advances exactly one NTSC tick per iteration. */
+-        if (turbo || runtime_uncapped) {
++        if (turbo || runtime_uncapped || s_vsync_paces) {
+             frame_pacer_reset(&frame_pacer);
+         } else {
+             Uint64 now = SDL_GetPerformanceCounter();
+diff --git a/runner/platform_switch.c b/runner/platform_switch.c
+index 196c3f5..1b3495a 100644
+--- a/runner/platform_switch.c
++++ b/runner/platform_switch.c
+@@ -66,8 +66,11 @@ const char *genesis_switch_base_dir(void)
+ void genesis_switch_open_log(void)
+ {
+ #if defined(__SWITCH__)
+-    char path[600];
++    char path[600], prev[600];
+     snprintf(path, sizeof path, "%slog.txt", genesis_switch_base_dir());
++    snprintf(prev, sizeof prev, "%slog.prev.txt", genesis_switch_base_dir());
++    remove(prev);
++    rename(path, prev);          /* keep the last session's log (e.g. one that hung) */
+     if (freopen(path, "w", stderr))
+         setvbuf(stderr, NULL, _IOFBF, 65536);   /* SD writes block: flushed at pauses/exit */
+ #endif
+diff --git a/runner/video/genesis_vdp.c b/runner/video/genesis_vdp.c
+index 3ffb355..89ccc17 100644
+--- a/runner/video/genesis_vdp.c
++++ b/runner/video/genesis_vdp.c
+@@ -404,6 +404,18 @@ uint16_t gvdp_peek_data(const GVDP *v)
+     }
+ }
+ 
++uint32_t (*gvdp_line_cycle_hook)(void);
++
++/* H-blank as seen by the 68K: about the last 18% of the 488-cycle line (H40), from the
++ * raster position when the scheduler provides it. */
++#define GVDP_68K_PER_LINE   488u
++#define GVDP_HBLANK_FROM    400u
++static int hblank_now(const GVDP *v)
++{
++    if (!gvdp_line_cycle_hook) return v->in_hblank;
++    return (gvdp_line_cycle_hook() % GVDP_68K_PER_LINE) >= GVDP_HBLANK_FROM;
++}
++
+ uint16_t gvdp_peek_status(const GVDP *v)
+ {
+     uint16_t s = 0x3400 | 0x0200;        /* open-bus high bits + FIFO empty    */
+@@ -411,7 +423,7 @@ uint16_t gvdp_peek_status(const GVDP *v)
+     if (v->sprite_overflow)  s |= 0x0040;
+     if (v->sprite_collision) s |= 0x0020;
+     if (v->in_vblank)        s |= 0x0008;
+-    if (v->in_hblank)        s |= 0x0004;
++    if (hblank_now(v))       s |= 0x0004;
+     if (v->dma_active)       s |= 0x0002;
+     return s;
+ }
+@@ -426,14 +438,13 @@ uint16_t gvdp_read_control(GVDP *v)
+     if (v->sprite_overflow)  s |= 0x0040;
+     if (v->sprite_collision) s |= 0x0020;
+     if (v->in_vblank)        s |= 0x0008;
+-    if (v->in_hblank)        s |= 0x0004;
++    if (hblank_now(v))       s |= 0x0004;
+     if (v->dma_active)       s |= 0x0002;
+     v->vint_pending = 0;
+-    /* Advance a phantom H-blank between status reads so 68K routines that pace
+-     * on the H-blank flag (e.g. Sonic 1's SEGA-chant DAC feeder, which polls
+-     * $C00004 bit 2 between samples) make progress under our per-whole-line
+-     * renderer instead of spinning forever. */
+-    v->in_hblank ^= 1;
++    /* Without a raster position (no hook), advance a phantom H-blank between status reads
++     * so 68K routines that pace on the H-blank flag (e.g. Sonic 1's SEGA-chant DAC feeder,
++     * which polls $C00004 bit 2 between samples) make progress instead of spinning. */
++    if (!gvdp_line_cycle_hook) v->in_hblank ^= 1;
+     return s;
+ }
+ 
+diff --git a/runner/video/genesis_vdp.h b/runner/video/genesis_vdp.h
+index f07baa2..02f46cb 100644
+--- a/runner/video/genesis_vdp.h
++++ b/runner/video/genesis_vdp.h
+@@ -281,6 +281,12 @@ const char *gvdp_plane_implementation(void);
+  * regardless of IE0 (games that poll vblank with IE0 off still run their Z80
+  * sound driver's per-frame tick). */
+ enum { GVDP_IRQ_HBLANK = 1, GVDP_IRQ_VBLANK = 2, GVDP_IRQ_Z80 = 4 };
++
++/* 68K cycles elapsed in the current scanline (set by the scheduler/glue). When set, the
++ * status register's H-blank flag (bit 2) follows the raster position instead of toggling
++ * on every read: games that count H-blank edges to find a line (Arcus Odyssey's intro
++ * raster scene) need edges at the real one-per-line rate. */
++extern uint32_t (*gvdp_line_cycle_hook)(void);
+ unsigned gvdp_begin_scanline(GVDP *v, int line);
+ 
+ #endif /* GENESIS_VDP_H */
+-- 
+2.50.1 (Apple Git-155)
+

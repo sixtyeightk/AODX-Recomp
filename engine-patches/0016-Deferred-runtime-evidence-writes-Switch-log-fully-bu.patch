@@ -1,0 +1,84 @@
+From 853b2d1780c9e05d06af03ee0f79011f45635f30 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:43:36 -0400
+Subject: [PATCH 16/18] Deferred runtime-evidence writes; Switch log fully
+ buffered, flushed when paused
+
+A periodic evidence rewrite on the game thread stalled Switch frames by 130-140 ms
+(SD card), audible as glitches. runtime_evidence_set_deferred(1): the host flushes
+at pauses and exit instead.
+---
+ runner/platform_switch.c  | 5 ++++-
+ runner/runtime_evidence.c | 5 ++++-
+ runner/runtime_evidence.h | 6 ++++++
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/runner/platform_switch.c b/runner/platform_switch.c
+index d9479ca..196c3f5 100644
+--- a/runner/platform_switch.c
++++ b/runner/platform_switch.c
+@@ -11,6 +11,7 @@
+  * and reopened: audren output can stay silent after a suspension otherwise.
+  */
+ #include "platform_switch.h"
++#include "runtime_evidence.h"
+ 
+ #if GENESIS_PLATFORM_SWITCH
+ 
+@@ -68,7 +69,7 @@ void genesis_switch_open_log(void)
+     char path[600];
+     snprintf(path, sizeof path, "%slog.txt", genesis_switch_base_dir());
+     if (freopen(path, "w", stderr))
+-        setvbuf(stderr, NULL, _IOLBF, 1024);
++        setvbuf(stderr, NULL, _IOFBF, 65536);   /* SD writes block: flushed at pauses/exit */
+ #endif
+ }
+ 
+@@ -97,6 +98,8 @@ int genesis_switch_frame(void)
+             paused = 1;
+             audio_set_playback_enabled(0);
+             fprintf(stderr, "[switch] out of focus: emulation paused\n");
++            runtime_evidence_flush();       /* paused: a slow SD write is invisible now */
++            fflush(stderr);
+         }
+         int quit = !appletMainLoop();
+         SDL_PumpEvents();
+diff --git a/runner/runtime_evidence.c b/runner/runtime_evidence.c
+index 1fdf9d1..93d8682 100644
+--- a/runner/runtime_evidence.c
++++ b/runner/runtime_evidence.c
+@@ -544,10 +544,13 @@ int runtime_evidence_count(RuntimeEvidenceKind kind)
+     return (unsigned)kind < RT_EVIDENCE_KIND_COUNT ? s_files[kind].n : 0;
+ }
+ 
++static int s_deferred;
++void runtime_evidence_set_deferred(int on) { s_deferred = on; }
++
+ void runtime_evidence_tick(void)
+ {
+     s_session_frames++;
+-    if (!s_inited || s_session_frames % FLUSH_CHECK_FRAMES) return;
++    if (!s_inited || s_deferred || s_session_frames % FLUSH_CHECK_FRAMES) return;
+     time_t now = time(NULL);
+     if (now - s_last_flush >= FLUSH_MIN_SECONDS) runtime_evidence_flush();
+ }
+diff --git a/runner/runtime_evidence.h b/runner/runtime_evidence.h
+index db452ce..be6c217 100644
+--- a/runner/runtime_evidence.h
++++ b/runner/runtime_evidence.h
+@@ -86,6 +86,12 @@ void runtime_evidence_tick(void);
+ /* Rewrite every file with current counters. Registered with atexit() too. */
+ void runtime_evidence_flush(void);
+ 
++/* Deferred mode: runtime_evidence_tick() never writes files; the host calls
++ * runtime_evidence_flush() at points where a slow storage write can't be seen
++ * (a pause menu, losing focus) and at exit. For hosts whose storage can block
++ * for 100+ ms (Switch SD card), where the periodic flush stalls a frame. */
++void runtime_evidence_set_deferred(int on);
++
+ /* FNV-1a 32 of the running executable module's bytes — the exact build
+  * identity (also the netplay build fingerprint). Never 0. */
+ uint32_t genesis_build_exe_fingerprint(void);
+-- 
+2.50.1 (Apple Git-155)
+

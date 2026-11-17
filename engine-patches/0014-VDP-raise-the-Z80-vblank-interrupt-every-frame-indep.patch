@@ -1,0 +1,75 @@
+From 7891f776386ad257a297902bf7be5cc9f2df7b0f Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:06:14 -0400
+Subject: [PATCH 14/18] VDP: raise the Z80 vblank interrupt every frame,
+ independent of the 68K's IE0
+
+The VDP drives Z80 /INT at vblank whether or not reg 1 IE0 is set; IE0 only
+gates the 68K's level-6 interrupt. Games that poll vblank with IE0 off (Arcus
+Odyssey during gameplay) never ran their Z80 driver's per-frame tick, so every
+sound effect played from it was silent.
+---
+ runner/video/genesis_machine.c | 8 +++++---
+ runner/video/genesis_vdp.c     | 1 +
+ runner/video/genesis_vdp.h     | 6 +++++-
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/runner/video/genesis_machine.c b/runner/video/genesis_machine.c
+index 72fdff1..4ec995a 100644
+--- a/runner/video/genesis_machine.c
++++ b/runner/video/genesis_machine.c
+@@ -493,8 +493,9 @@ void machine_run_frame(GenesisScanlineSink sink, void *user)
+ 
+         /* Deliver interrupts to the 68K (and the Z80 at vblank). */
+         if (irq & GVDP_IRQ_HBLANK) glue_own_interrupt(4, &m->vdp);
+-        if (irq & GVDP_IRQ_VBLANK) {
+-            /* Assert the Z80 vblank IRQ and LEAVE it pending — the Z80 takes it
++        if (irq & GVDP_IRQ_Z80) {
++            /* Assert the Z80 vblank IRQ (every frame: the VDP drives Z80 /INT
++             * whether or not the 68K's IE0 is set) and LEAVE it pending — the Z80 takes it
+              * on a later step_z80 (when IFF1 is enabled) and superzazu clears
+              * int_pending on accept. The old code de-asserted immediately with
+              * no Z80 step in between, so the Z80 never took the interrupt: its
+@@ -520,8 +521,9 @@ void machine_run_frame(GenesisScanlineSink sink, void *user)
+ #else
+             m->z80.int_pending = 1;   /* level-triggered vblank IRQ assert */
+ #endif
+-            glue_own_interrupt(6, &m->vdp);
+         }
++        if (irq & GVDP_IRQ_VBLANK)
++            glue_own_interrupt(6, &m->vdp);
+ 
+         /* Render + emit active scanlines. In interlace mode 2 each raster
+          * line yields TWO output rows (the even and odd fields' lines,
+diff --git a/runner/video/genesis_vdp.c b/runner/video/genesis_vdp.c
+index 85bfd1a..3ffb355 100644
+--- a/runner/video/genesis_vdp.c
++++ b/runner/video/genesis_vdp.c
+@@ -465,6 +465,7 @@ unsigned gvdp_begin_scanline(GVDP *v, int line)
+         if (line == active_h) {        /* entering vblank                     */
+             v->in_vblank = 1;
+             v->vint_pending = 1;
++            irq |= GVDP_IRQ_Z80;
+             if (MODE2_VINT_ON(v)) irq |= GVDP_IRQ_VBLANK;
+         }
+     }
+diff --git a/runner/video/genesis_vdp.h b/runner/video/genesis_vdp.h
+index 5f8ecbf..f07baa2 100644
+--- a/runner/video/genesis_vdp.h
++++ b/runner/video/genesis_vdp.h
+@@ -276,7 +276,11 @@ const char *gvdp_plane_implementation(void);
+ /* Called by the scheduler at the start of each scanline; advances the H-int
+  * counter and sets/clears V-int pending at the vblank boundary. Returns a mask
+  * of interrupts that should fire this line. */
+-enum { GVDP_IRQ_HBLANK = 1, GVDP_IRQ_VBLANK = 2 };
++/* GVDP_IRQ_VBLANK: the 68K level-6 interrupt (gated by reg 1 IE0).
++ * GVDP_IRQ_Z80: the Z80 /INT pulse at vblank, which the VDP drives every frame
++ * regardless of IE0 (games that poll vblank with IE0 off still run their Z80
++ * sound driver's per-frame tick). */
++enum { GVDP_IRQ_HBLANK = 1, GVDP_IRQ_VBLANK = 2, GVDP_IRQ_Z80 = 4 };
+ unsigned gvdp_begin_scanline(GVDP *v, int line);
+ 
+ #endif /* GENESIS_VDP_H */
+-- 
+2.50.1 (Apple Git-155)
+

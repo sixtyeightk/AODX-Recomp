@@ -1,0 +1,24 @@
+From b111654f8cddb6abe8289d81f9de62bb5870e27e Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:05:02 -0400
+Subject: [PATCH 04/18] Finalize --wav when an input script EXITs
+
+---
+ runner/main.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/runner/main.c b/runner/main.c
+index bee06f6..f8e158e 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -3649,6 +3649,7 @@ session_begin:;
+                         input_script_exit_code());
+                 if (s_sram_dirty) runner_sram_flush();
+                 dump_exec_coverage(exec_cov_out);
++                audio_wav_stop();          /* finalize --wav (header sizes) */
+                 return input_script_exit_code();
+             }
+         }
+-- 
+2.50.1 (Apple Git-155)
+

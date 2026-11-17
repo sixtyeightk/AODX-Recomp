@@ -1,0 +1,18 @@
+# build inputs and outputs (never committed)
+/build/
+/switch/
+/*.app/
+/*.tar.gz
+/rom/
+/build*/
+/out/
+/extras-cache/
+/trailer-cache/
+/release-cache/
+/.cache/
+/.venv/
+/engine/
+/game/*.bin
+__pycache__/
+.DS_Store
+/.staged-by-stage-repo

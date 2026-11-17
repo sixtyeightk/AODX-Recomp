@@ -1,0 +1,102 @@
+From 0a8daebc7f5694d04d5b63066f00d6e6490dadb7 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:46:00 -0400
+Subject: [PATCH 11/18] Audio: optional speaker output stage (DC blocker +
+ soft-knee gain), off by default
+
+---
+ runner/audio.c | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ runner/audio.h |  5 +++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/runner/audio.c b/runner/audio.c
+index bf307da..5d9c270 100644
+--- a/runner/audio.c
++++ b/runner/audio.c
+@@ -2,6 +2,7 @@
+ #include <SDL2/SDL.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <math.h>
+ 
+ /* Shared clock-domain bridge: persistent band-limited polyphase resampler + a
+  * P-only normalized-fill controller, plus Phase-1 stall concealment (boot
+@@ -25,6 +26,51 @@ void audio_set_psg_vol_div(int d) { if (d >= 1 && d <= 64) s_psg_vol_div = d; }
+ /* Master output volume (launcher / settings.ini). 0..256 fixed-point gain
+  * applied to the SPEAKER stream only — the WAV capture tap stays bit-exact. */
+ static int s_master_vol = 256;
++/* Optional speaker output stage (off by default, so other games are unchanged):
++ * a one-pole DC blocker (the YM2612/PSG mix carries a DC offset that steps as
++ * channels key on/off, which clicks when playback pauses/resumes), then a gain
++ * with a soft knee that approaches full scale instead of hard-clipping. */
++static int    s_stage_on = 0;
++static float  s_stage_gain = 1.0f;
++static float  s_stage_fc = 0.0f;
++static float  s_dc_a = 1.0f, s_dc_x[2], s_dc_y[2];
++
++void audio_set_output_stage(int dc_block_hz, int gain_pct)
++{
++    s_stage_on   = dc_block_hz > 0 || gain_pct != 100;
++    s_stage_gain = gain_pct / 100.0f;
++    s_stage_fc   = (float)dc_block_hz;
++    s_dc_a = 1.0f;                       /* coefficient set on first use (rate known then) */
++    s_dc_x[0] = s_dc_x[1] = s_dc_y[0] = s_dc_y[1] = 0.0f;
++}
++
++static int16_t soft_knee(float v)
++{
++    const float knee = 24576.0f, room = 32767.0f - 24576.0f;
++    float m = v < 0 ? -v : v;
++    if (m > knee) m = knee + (m - knee) / (1.0f + (m - knee) / room);
++    if (m > 32767.0f) m = 32767.0f;
++    return (int16_t)(v < 0 ? -m : m);
++}
++
++void audio_output_stage_process(int16_t *buf, size_t frames, double rate)
++{
++    if (!s_stage_on || rate <= 0) return;
++    if (s_dc_a >= 1.0f && s_stage_fc > 0)
++        s_dc_a = (float)exp(-2.0 * 3.14159265358979 * s_stage_fc / rate);
++    for (size_t i = 0; i < frames; i++)
++        for (int c = 0; c < 2; c++) {
++            float x = buf[i * 2 + c];
++            float y = x;
++            if (s_stage_fc > 0) {
++                y = s_dc_a * (s_dc_y[c] + x - s_dc_x[c]);
++                s_dc_x[c] = x;
++                s_dc_y[c] = y;
++            }
++            buf[i * 2 + c] = soft_knee(y * s_stage_gain);
++        }
++}
++
+ void audio_set_master_volume(int pct)
+ {
+     if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+@@ -326,6 +372,7 @@ void audio_flush(uint32_t wall_frame, int realtime,
+         for (size_t i = 0; i < psg_frames * 2; i++)
+             s_out[i] = (int16_t)((int32_t)s_out[i] * s_master_vol / 256);
+     }
++    audio_output_stage_process(s_out, psg_frames, (double)s_mix_rate);
+ 
+     /* Hand the mixed frame to the DRC bridge. Realtime only: in turbo there is
+      * no device playback, so pushing would just overflow the ring. The lock
+diff --git a/runner/audio.h b/runner/audio.h
+index 7bb7473..03bc309 100644
+--- a/runner/audio.h
++++ b/runner/audio.h
+@@ -21,6 +21,11 @@ int  audio_reopen(void);
+  * the WAV capture tap stays bit-exact. */
+ void audio_set_master_volume(int pct);
+ 
++/* Speaker-only output stage (after the --wav tap): DC blocker at dc_block_hz
++ * (0 = off) and gain_pct with a soft knee. Off by default. */
++void audio_set_output_stage(int dc_block_hz, int gain_pct);
++void audio_output_stage_process(int16_t *buf, size_t frames, double rate);
++
+ /* Pause speaker delivery during uncapped turbo. Re-enabling discards stale
+  * pre-turbo audio and primes the clock-domain bridge from the current game
+  * state, so turbo is silent and normal-speed playback resumes cleanly. WAV
+-- 
+2.50.1 (Apple Git-155)
+

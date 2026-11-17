@@ -1,0 +1,40 @@
+From 5b51ab8f18c197b22bc565d2a6a5dc3091a66dfd Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:24:30 -0400
+Subject: [PATCH 10/18] E8: pace one Genesis frame per 60 Hz vblank on Switch
+
+The Switch panel and TV output run at 60 Hz with vsync, so the default pacer
+target there is 60.0 fps instead of NTSC 59.94 (debug.ini / --target-fps still
+win). The audio DRC bridge (48 kHz S16 stereo device, +/-0.5% ratio servo)
+absorbs the 0.1% difference, so audio neither drifts nor drops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/main.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/runner/main.c b/runner/main.c
+index cc4fa8f..8025687 100644
+--- a/runner/main.c
++++ b/runner/main.c
+@@ -2962,9 +2962,16 @@ int main(int argc, char *argv[])
+                 s_interlace_display_mode == INTERLACE_DISPLAY_RAW ? "raw" : "tv");
+     }
+     /* --target-fps wins over debug.ini, which wins over default 59.94. */
++#if GENESIS_PLATFORM_SWITCH
++    /* Switch: the panel/TV runs at 60 Hz with vsync. Pace one Genesis frame
++     * per vblank; the audio DRC bridge absorbs the 0.1% rate difference. */
++    const double default_target_fps = 60.0;
++#else
++    const double default_target_fps = 60000.0 / 1001.0;  /* NTSC */
++#endif
+     double target_fps = (target_fps_cli > 0.0)     ? target_fps_cli :
+                         (target_fps_from_ini > 0.0) ? target_fps_from_ini :
+-                                                       (60000.0 / 1001.0);  /* NTSC */
++                                                       default_target_fps;
+     fprintf(stderr, "[pacer] target frame rate: %.4f fps\n", target_fps);
+     int debug_port = debug_port_cli ? debug_port_cli :
+                      (debug_port_from_ini ? debug_port_from_ini :
+-- 
+2.50.1 (Apple Git-155)
+

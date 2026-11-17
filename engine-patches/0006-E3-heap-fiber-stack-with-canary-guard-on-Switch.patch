@@ -1,0 +1,231 @@
+From fc1847f55692136dd2408e5b24148d2548e62523 Mon Sep 17 00:00:00 2001
+From: sixtyeightk <sixtyeightk@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:24:30 -0400
+Subject: [PATCH 06/18] E3: heap fiber stack with canary guard on Switch
+
+libnx has no mmap/mprotect. Under __SWITCH__ (and GENESIS_SWITCH_STUBS, the
+desktop build that runs the Switch code paths against libnx stubs), the fiber
+mapping comes from memalign/posix_memalign. The guard region keeps its place
+below the stack but is a canary pattern instead of a no-access page:
+fiber_guard_intact() detects writes into it and fiber_stack_high_water()
+reports the deepest use (the stack is pre-filled).
+
+glue.c: the game fiber stack is 1 MiB there (not 32 MiB), with the runaway
+warn/abort thresholds scaled to it; the canary is checked once per frame at
+WaitForVint (crash report + exit on overflow) and the high-water mark is
+logged at exit. Measured on the stub build: ~5 KB through boot, Act 1 and the
+attract demo. Desktop builds are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/fiber_compat.c | 71 +++++++++++++++++++++++++++++++++++++++++--
+ runner/fiber_compat.h |  8 +++++
+ runner/glue.c         | 38 +++++++++++++++++++++--
+ 3 files changed, 112 insertions(+), 5 deletions(-)
+
+diff --git a/runner/fiber_compat.c b/runner/fiber_compat.c
+index 891e3f8..01a7214 100644
+--- a/runner/fiber_compat.c
++++ b/runner/fiber_compat.c
+@@ -35,8 +35,25 @@
+ #define MINICORO_IMPL
+ #include "external/minicoro/minicoro.h"
+ 
++/* Heap-stack mode (Nintendo Switch, and the Mac build that runs the Switch
++ * code paths against libnx stubs): libnx has no mmap/mprotect, so the fiber
++ * mapping comes from an aligned heap allocation. The guard region keeps its
++ * place under the stack but cannot be made no-access; it is filled with a
++ * canary pattern instead, and fiber_guard_intact() checks it (glue.c does so
++ * once per frame). The usable stack is pre-filled too, so
++ * fiber_stack_high_water() can report the deepest use. */
++#if defined(__SWITCH__) || defined(GENESIS_SWITCH_STUBS)
++#  define FIBER_HEAP_STACK 1
++#  define FIBER_CANARY_BYTE 0xC5u
++#  define FIBER_FILL_BYTE   0x5Au
++#endif
++
+ #if defined(_WIN32)
+ #  include <windows.h>
++#elif defined(FIBER_HEAP_STACK)
++#  if defined(__SWITCH__)
++#    include <malloc.h>   /* memalign */
++#  endif
+ #else
+ #  include <sys/mman.h>
+ #  include <unistd.h>
+@@ -108,7 +125,9 @@ static size_t align_up(size_t v, size_t a) { return (v + (a - 1)) & ~(a - 1); }
+ 
+ static size_t os_page_size(void)
+ {
+-#if defined(_WIN32)
++#if defined(FIBER_HEAP_STACK)
++    return 4096u;   /* allocation alignment only: there is no page protection */
++#elif defined(_WIN32)
+     SYSTEM_INFO si;
+     GetSystemInfo(&si);
+     return si.dwPageSize ? (size_t)si.dwPageSize : 4096u;
+@@ -161,7 +180,20 @@ static void fiber_require_no_shadow_stack(void)
+ 
+ static unsigned char *os_map(size_t size, size_t guard_off, size_t guard_size)
+ {
+-#if defined(_WIN32)
++#if defined(FIBER_HEAP_STACK)
++    void *m = NULL;
++#  if defined(__SWITCH__)
++    m = memalign(4096u, size);
++#  else
++    if (posix_memalign(&m, 4096u, size) != 0) m = NULL;
++#  endif
++    if (!m) return NULL;
++    memset(m, 0, guard_off);
++    memset((unsigned char *)m + guard_off, FIBER_CANARY_BYTE, guard_size);
++    memset((unsigned char *)m + guard_off + guard_size, FIBER_FILL_BYTE,
++           size - guard_off - guard_size);
++    return (unsigned char *)m;
++#elif defined(_WIN32)
+     unsigned char *m = (unsigned char *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+                                                      PAGE_READWRITE);
+     if (!m) return NULL;
+@@ -185,7 +217,10 @@ static unsigned char *os_map(size_t size, size_t guard_off, size_t guard_size)
+ static void os_unmap(unsigned char *m, size_t size)
+ {
+     if (!m) return;
+-#if defined(_WIN32)
++#if defined(FIBER_HEAP_STACK)
++    (void)size;
++    free(m);
++#elif defined(_WIN32)
+     (void)size;
+     VirtualFree(m, 0, MEM_RELEASE);
+ #else
+@@ -454,3 +489,33 @@ int fiber_stack_range(fiber_t fiber, uintptr_t *lo, uintptr_t *top)
+     if (top) *top = f->stack_top;
+     return 0;
+ }
++
++int fiber_guard_intact(fiber_t fiber)
++{
++#if defined(FIBER_HEAP_STACK)
++    fiber_impl *f = (fiber_impl *)fiber;
++    if (!f || f->magic != FIBER_IMPL_MAGIC || f->is_thread) return 1;
++    const unsigned char *g = f->map + f->header_size;
++    for (size_t i = 0; i < f->guard_size; i++)
++        if (g[i] != FIBER_CANARY_BYTE) return 0;
++    return 1;
++#else
++    (void)fiber;
++    return 1;   /* hardware guard: an overflow faults instead */
++#endif
++}
++
++size_t fiber_stack_high_water(fiber_t fiber)
++{
++#if defined(FIBER_HEAP_STACK)
++    fiber_impl *f = (fiber_impl *)fiber;
++    if (!f || f->magic != FIBER_IMPL_MAGIC || f->is_thread) return 0;
++    const unsigned char *p = (const unsigned char *)f->stack_lo;
++    size_t n = (size_t)(f->stack_top - f->stack_lo), i = 0;
++    while (i < n && p[i] == FIBER_FILL_BYTE) i++;
++    return n - i;
++#else
++    (void)fiber;
++    return 0;
++#endif
++}
+diff --git a/runner/fiber_compat.h b/runner/fiber_compat.h
+index ff0efc0..e8dd410 100644
+--- a/runner/fiber_compat.h
++++ b/runner/fiber_compat.h
+@@ -146,6 +146,14 @@ int fiber_snapshot_load(fiber_t fiber, const void *src, size_t len);
+  * the thread fiber / NULL. Used by rollback diagnostics (stack scans). */
+ int fiber_stack_range(fiber_t fiber, uintptr_t *lo, uintptr_t *top);
+ 
++/* Heap-stack builds (Switch, and the Mac Switch-stub build) have no
++ * no-access guard: the guard region is a canary pattern instead.
++ * fiber_guard_intact returns 0 once anything wrote into it (a stack overflow
++ * reached the guard); fiber_stack_high_water returns the deepest stack use
++ * in bytes so far. Elsewhere they return 1 and 0 (the guard faults). */
++int fiber_guard_intact(fiber_t fiber);
++size_t fiber_stack_high_water(fiber_t fiber);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runner/glue.c b/runner/glue.c
+index 8b24f51..adb2050 100644
+--- a/runner/glue.c
++++ b/runner/glue.c
+@@ -469,9 +469,20 @@ static void yield_to_main(GlueYieldSite site)
+ 
+ /* Engine-owned game fiber stack: fully committed, guard page below, never
+  * moved or reallocated for the life of the process (fiber_compat.h). */
++#if defined(__SWITCH__) || defined(GENESIS_SWITCH_STUBS)
++/* Switch: the stack is a heap block with a canary guard (no page protection,
++ * fiber_compat.c), so keep it small and abort well before the guard. The
++ * deepest use measured on the Mac Switch-stub build is logged at shutdown. */
++#define GAME_FIBER_STACK_SIZE      (1024u * 1024u)
++#define GAME_FIBER_STACK_WARN_STEP (128u * 1024u)
++#define GAME_FIBER_STACK_ABORT     (896u * 1024u)
++#define GAME_FIBER_STACK_CANARY    1
++#else
+ #define GAME_FIBER_STACK_SIZE    (32u * 1024u * 1024u)
+ #define GAME_FIBER_STACK_WARN_STEP (1024u * 1024u)
+ #define GAME_FIBER_STACK_ABORT     (28u * 1024u * 1024u)
++#define GAME_FIBER_STACK_CANARY    0
++#endif
+ 
+ static uintptr_t s_game_stack_top = 0;
+ static size_t    s_game_stack_last_report = 0;
+@@ -618,8 +629,22 @@ static void game_fiber_func(void *param)
+     for (;;) yield_to_main(GLUE_YIELD_HALT);
+ }
+ 
++#if GAME_FIBER_STACK_CANARY
++static void report_game_stack_high_water(void)
++{
++    if (s_game_fiber)
++        fprintf(stderr, "[STACK] game fiber high water %zu of %u bytes, guard %s\n",
++                fiber_stack_high_water(s_game_fiber), (unsigned)GAME_FIBER_STACK_SIZE,
++                fiber_guard_intact(s_game_fiber) ? "intact" : "OVERWRITTEN");
++}
++#endif
++
+ static int create_game_fiber(uint32_t resume_pc)
+ {
++#if GAME_FIBER_STACK_CANARY
++    static int s_reported;
++    if (!s_reported) { s_reported = 1; atexit(report_game_stack_high_water); }
++#endif
+     s_game_fiber_resume_pc = resume_pc & 0xFFFFFFu;
+     s_game_fiber = fiber_create(GAME_FIBER_STACK_SIZE,
+                                 GAME_FIBER_STACK_SIZE,
+@@ -1108,6 +1133,14 @@ void glue_yield_for_vblank(void)
+     if (s_state_requested && g_game_spec.state_at_boundary && g_game_spec.state_at_boundary())
+         s_state_parked=1;
+     { char stack_marker; game_stack_note("WaitForVint", &stack_marker); }
++#if GAME_FIBER_STACK_CANARY
++    /* Once per frame: no guard page, so detect an overflow by its canary. */
++    if (!fiber_guard_intact(s_game_fiber)) {
++        crash_report_dump_persistent("game fiber stack overflow: guard canary overwritten",
++                                     &g_cpu, 0, 0, g_frame_count);
++        exit(2);
++    }
++#endif
+     yield_to_main(GLUE_YIELD_VBLANK);
+     /* STAGE 1 interleaved IRQ: the scheduler flagged a V-int/H-int while we were
+      * parked here. Run its handler NOW, on this (game) fiber — its bus accesses
+@@ -1293,8 +1326,9 @@ void glue_init(const cc_u8l *rom_bytes, cc_u32l rom_byte_len)
+     {
+         uintptr_t lo = 0, top = 0;
+         fiber_stack_range(s_game_fiber, &lo, &top);
+-        fprintf(stderr, "[fiber] game stack %zu bytes (engine-owned, committed, guard page)\n",
+-                (size_t)(top - lo));
++        fprintf(stderr, "[fiber] game stack %zu bytes (engine-owned, committed, %s)\n",
++                (size_t)(top - lo),
++                GAME_FIBER_STACK_CANARY ? "canary guard" : "guard page");
+     }
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
